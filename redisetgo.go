@@ -165,31 +165,33 @@ func (ib *indexBuffer) createDoc(op *gtm.Op) redisearch.Document {
 
 func (ib *indexBuffer) toSchema() *redisearch.Schema {
 	sc := redisearch.NewSchema(redisearch.DefaultOptions)
-	if len(ib.items) > 0 {
-		item := ib.items[0]
-		if item.Properties != nil {
-			for k, v := range item.Properties {
-				switch v.(type) {
-				case map[string]interface{}:
-					break
-				case []interface{}:
-					break
-				case time.Time:
-					sc.AddField(redisearch.NewNumericField(k))
-				case int:
-					sc.AddField(redisearch.NewNumericField(k))
-				case int32:
-					sc.AddField(redisearch.NewNumericField(k))
-				case int64:
-					sc.AddField(redisearch.NewNumericField(k))
-				case float32:
-					sc.AddField(redisearch.NewNumericField(k))
-				case float64:
-					sc.AddField(redisearch.NewNumericField(k))
-				default:
-					sc.AddField(redisearch.NewTextField(k))
-				}
-			}
+	if len(ib.items) == 0 {
+		return sc
+	}
+	item := ib.items[0]
+	if item.Properties == nil {
+		return sc
+	}
+	for k, v := range item.Properties {
+		switch v.(type) {
+		case map[string]interface{}:
+			break
+		case []interface{}:
+			break
+		case time.Time:
+			sc.AddField(redisearch.NewNumericField(k))
+		case int:
+			sc.AddField(redisearch.NewNumericField(k))
+		case int32:
+			sc.AddField(redisearch.NewNumericField(k))
+		case int64:
+			sc.AddField(redisearch.NewNumericField(k))
+		case float32:
+			sc.AddField(redisearch.NewNumericField(k))
+		case float64:
+			sc.AddField(redisearch.NewNumericField(k))
+		default:
+			sc.AddField(redisearch.NewTextField(k))
 		}
 	}
 	return sc
