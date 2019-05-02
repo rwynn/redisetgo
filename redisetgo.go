@@ -42,14 +42,14 @@ type indexBuffer struct {
 	items         []redisearch.Document
 	maxDuration   time.Duration
 	maxItems      int
-    maxSize       int64
+	maxSize       int64
 	stopC         chan bool
 	maxRetry      int
 	retryDuration time.Duration
 	logs          *loggers
 	stats         *indexStats
 	createIndex   bool
-    curSize       int64
+	curSize       int64
 }
 
 type indexWorker struct {
@@ -59,7 +59,7 @@ type indexWorker struct {
 	buffers     int
 	maxDuration time.Duration
 	maxItems    int
-    maxSize     int64
+	maxSize     int64
 	stopC       chan bool
 	allWg       *sync.WaitGroup
 	logs        *loggers
@@ -75,7 +75,7 @@ type indexClient struct {
 	stopC         chan bool
 	maxDuration   time.Duration
 	maxItems      int
-    maxSize       int64
+	maxSize       int64
 	allWg         *sync.WaitGroup
 	logs          *loggers
 	stats         *indexStats
@@ -230,8 +230,8 @@ func (ib *indexBuffer) autoCreateIndex() (*redisearch.IndexInfo, error) {
 
 func (ib *indexBuffer) flush() (err error) {
 	if len(ib.items) == 0 {
-        ib.items = nil
-        ib.curSize = 0
+		ib.items = nil
+		ib.curSize = 0
 		return
 	}
 	docs := ib.items
@@ -249,28 +249,28 @@ func (ib *indexBuffer) flush() (err error) {
 	}
 	ib.afterFlush(err)
 	ib.items = nil
-    ib.curSize = 0
+	ib.curSize = 0
 	return
 }
 
 func (ib *indexBuffer) full() bool {
-    if ib.maxItems != 0 {
-        if len(ib.items) >= ib.maxItems {
-            return true
-        }
-    }
-    if ib.maxSize != 0 {
-        if ib.curSize >= ib.maxSize {
-            return true
-        }
-    }
-    return false
+	if ib.maxItems != 0 {
+		if len(ib.items) >= ib.maxItems {
+			return true
+		}
+	}
+	if ib.maxSize != 0 {
+		if ib.curSize >= ib.maxSize {
+			return true
+		}
+	}
+	return false
 }
 
 func (ib *indexBuffer) addItem(op *gtm.Op) {
-    doc := ib.createDoc(op)
+	doc := ib.createDoc(op)
 	ib.items = append(ib.items, doc)
-    ib.curSize += int64(doc.EstimateSize())
+	ib.curSize += int64(doc.EstimateSize())
 	if ib.full() {
 		if err := ib.flush(); err != nil {
 			ib.logs.errorLog.Printf("Indexing failed: %s", err)
@@ -341,7 +341,7 @@ func newIndexClient(ctx *gtm.OpCtx) *indexClient {
 		workers:       make(map[string]*indexWorker),
 		maxDuration:   time.Duration(1) * time.Second,
 		maxItems:      1000,
-        maxSize:       0,
+		maxSize:       0,
 		logs:          newLoggers(),
 		stats:         &indexStats{},
 		createIndex:   true,
@@ -366,10 +366,10 @@ func (ic *indexClient) sigListen() {
 }
 
 func (ic *indexClient) logStats() {
-    stats := ic.stats.dup()
-    if b, err := json.Marshal(stats); err == nil {
-        ic.logs.infoLog.Printf("Indexing stats: %s", string(b))
-    }
+	stats := ic.stats.dup()
+	if b, err := json.Marshal(stats); err == nil {
+		ic.logs.infoLog.Printf("Indexing stats: %s", string(b))
+	}
 }
 
 func (ic *indexClient) statsLoop() {
@@ -379,9 +379,9 @@ func (ic *indexClient) statsLoop() {
 	for !done {
 		select {
 		case <-heartBeat.C:
-            ic.logStats()
+			ic.logStats()
 		case <-ic.stopC:
-            ic.logStats()
+			ic.logStats()
 			done = true
 		}
 	}
@@ -394,9 +394,9 @@ func (client *indexClient) eventLoop() {
 	for {
 		select {
 		case err := <-ctx.ErrC:
-            if err == nil {
-                break
-            }
+			if err == nil {
+				break
+			}
 			client.logs.errorLog.Println(err)
 		case op := <-ctx.OpC:
 			if op == nil {
@@ -437,7 +437,7 @@ func (ic *indexClient) add(op *gtm.Op) *indexClient {
 			namespace:   op.Namespace,
 			maxDuration: ic.maxDuration,
 			maxItems:    ic.maxItems,
-            maxSize:     ic.maxSize,
+			maxSize:     ic.maxSize,
 			workQ:       make(chan *gtm.Op),
 			stopC:       ic.stopC,
 			allWg:       ic.allWg,
