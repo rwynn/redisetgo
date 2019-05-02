@@ -68,6 +68,7 @@ type indexWorker struct {
 }
 
 type indexClient struct {
+	readC         chan bool
 	readContext   *gtm.OpCtx
 	addrs         string
 	redisClients  map[string]*redisearch.Client
@@ -269,18 +270,23 @@ func (ib *indexBuffer) full() bool {
 	return false
 }
 
+func (ib *indexBuffer) indexFailed(err error) {
+	ib.logs.errorLog.Printf("Indexing failed: %s", err)
+}
+
 func (ib *indexBuffer) addItem(op *gtm.Op) {
 	doc := ib.createDoc(op)
 	ib.items = append(ib.items, doc)
 	ib.curSize += int64(doc.EstimateSize())
 	if ib.full() {
 		if err := ib.flush(); err != nil {
-			ib.logs.errorLog.Printf("Indexing failed: %s", err)
+			ib.indexFailed(err)
 		}
 	}
 }
 
 func (ib *indexBuffer) run() {
+	defer ib.worker.allWg.Done()
 	timer := time.NewTicker(ib.maxDuration)
 	defer timer.Stop()
 	done := false
@@ -290,14 +296,14 @@ func (ib *indexBuffer) run() {
 			ib.addItem(op)
 		case <-timer.C:
 			if err := ib.flush(); err != nil {
-				ib.logs.errorLog.Printf("Indexing failed: %s", err)
+				ib.indexFailed(err)
 			}
 		case <-ib.stopC:
 			done = true
 		}
 	}
 	if err := ib.flush(); err != nil {
-		ib.logs.errorLog.Printf("Indexing failed: %s", err)
+		ib.indexFailed(err)
 	}
 }
 
@@ -335,6 +341,7 @@ func newLoggers() *loggers {
 
 func newIndexClient(ctx *gtm.OpCtx) *indexClient {
 	return &indexClient{
+		readC:         make(chan bool),
 		readContext:   ctx,
 		allWg:         &sync.WaitGroup{},
 		stopC:         make(chan bool),
@@ -362,7 +369,6 @@ func (ic *indexClient) sigListen() {
 		os.Exit(1)
 	}()
 	ic.logs.infoLog.Println("Shutting down")
-	ic.readContext.Stop()
 	ic.stop()
 	os.Exit(0)
 }
@@ -393,6 +399,7 @@ func (client *indexClient) eventLoop() {
 	go client.sigListen()
 	go client.statsLoop()
 	ctx := client.readContext
+	drained := false
 	for {
 		select {
 		case err := <-ctx.ErrC:
@@ -400,8 +407,12 @@ func (client *indexClient) eventLoop() {
 				break
 			}
 			client.logs.errorLog.Println(err)
-		case op := <-ctx.OpC:
+		case op, open := <-ctx.OpC:
 			if op == nil {
+				if !open && !drained {
+					drained = true
+					close(client.readC)
+				}
 				break
 			}
 			client.add(op)
@@ -420,6 +431,8 @@ func (ic *indexClient) setCreateIndex(b bool) *indexClient {
 }
 
 func (ic *indexClient) stop() {
+	ic.readContext.Stop()
+	<-ic.readC
 	close(ic.stopC)
 	ic.allWg.Wait()
 }
