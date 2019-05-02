@@ -151,9 +151,7 @@ func (ib *indexBuffer) createDoc(op *gtm.Op) redisearch.Document {
 			continue
 		}
 		switch val := v.(type) {
-		case map[string]interface{}:
-			continue
-		case []interface{}:
+		case map[string]interface{}, []interface{}:
 			continue
 		case time.Time:
 			doc.Set(k, val.Unix())
@@ -175,21 +173,9 @@ func (ib *indexBuffer) toSchema() *redisearch.Schema {
 	}
 	for k, v := range item.Properties {
 		switch v.(type) {
-		case map[string]interface{}:
+		case map[string]interface{}, []interface{}:
 			break
-		case []interface{}:
-			break
-		case time.Time:
-			sc.AddField(redisearch.NewNumericField(k))
-		case int:
-			sc.AddField(redisearch.NewNumericField(k))
-		case int32:
-			sc.AddField(redisearch.NewNumericField(k))
-		case int64:
-			sc.AddField(redisearch.NewNumericField(k))
-		case float32:
-			sc.AddField(redisearch.NewNumericField(k))
-		case float64:
+		case time.Time, int, int32, int64, float32, float64:
 			sc.AddField(redisearch.NewNumericField(k))
 		default:
 			sc.AddField(redisearch.NewTextField(k))
