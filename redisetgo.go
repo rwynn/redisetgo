@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"github.com/RedisLabs/redisearch-go/redisearch"
+	"github.com/BurntSushi/toml"
+	"github.com/RediSearch/redisearch-go/redisearch"
 	"github.com/rwynn/gtm"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
@@ -21,9 +23,203 @@ import (
 	"time"
 )
 
+const (
+	version = "0.0.1"
+)
+
+var (
+	infoLog  = log.New(os.Stderr, "INFO ", log.Flags())
+	warnLog  = log.New(os.Stdout, "WARN ", log.Flags())
+	statsLog = log.New(os.Stdout, "STATS ", log.Flags())
+	traceLog = log.New(os.Stdout, "TRACE ", log.Flags())
+	errorLog = log.New(os.Stderr, "ERROR ", log.Flags())
+)
+
+type stringargs []string
+
+type config struct {
+	ConfigFile           string
+	MongoURI             string     `toml:"mongo"`
+	RedisearchAddrs      string     `toml:"redisearch"`
+	DisableCreateIndex   bool       `toml:"disable-create-index"`
+	MaxItems             int        `toml:"max-items"`
+	MaxSize              int64      `toml:"max-size"`
+	MaxDuration          string     `toml:"max-duration"`
+	StatsDuration        string     `toml:"stats-duration"`
+	Indexers             int        `toml:"indexers"`
+	ChangeStreamNs       stringargs `toml:"change-stream-namespaces"`
+	DirectReadNs         stringargs `toml:"direct-read-namespaces"`
+	DirectReadSplitMax   int        `toml:"direct-read-split-max"`
+	DirectReadConcur     int        `toml:"direct-read-concur"`
+	FailFast             bool       `toml:"fail-fast"`
+	ExitAfterDirectReads bool       `toml:"exit-after-direct-reads"`
+	DisableStats         bool       `toml:"disable-stats"`
+}
+
+func (c *config) hasFlag(name string) bool {
+	passed := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			passed = true
+		}
+	})
+	return passed
+}
+
+func (c *config) log(out *log.Logger) {
+	if b, err := json.MarshalIndent(c, "", "  "); err == nil {
+		out.Println(string(b))
+	}
+}
+
+func (c *config) setDefaults() *config {
+	if len(c.ChangeStreamNs) == 0 {
+		c.ChangeStreamNs = []string{""}
+	}
+	if len(c.DirectReadNs) == 0 {
+		c.DirectReadNs = []string{}
+	}
+	return c
+}
+
+func (c *config) validate() error {
+	if c.MaxDuration != "" {
+		if _, err := time.ParseDuration(c.MaxDuration); err != nil {
+			return fmt.Errorf("Invalid MaxDuration: %s", err)
+		}
+	} else {
+		return fmt.Errorf("MaxDuration cannot be empty")
+	}
+	if c.StatsDuration != "" {
+		if _, err := time.ParseDuration(c.StatsDuration); err != nil {
+			return fmt.Errorf("Invalid StatsDuration: %s", err)
+		}
+	} else {
+		return fmt.Errorf("StatsDuration cannot be empty")
+	}
+	return nil
+}
+
+func (c *config) override(fc *config) {
+	if !c.hasFlag("mongo") && fc.MongoURI != "" {
+		c.MongoURI = fc.MongoURI
+	}
+	if !c.hasFlag("redisearch") && fc.RedisearchAddrs != "" {
+		c.RedisearchAddrs = fc.RedisearchAddrs
+	}
+	if fc.DisableCreateIndex {
+		c.DisableCreateIndex = true
+	}
+	if fc.FailFast {
+		c.FailFast = true
+	}
+	if fc.ExitAfterDirectReads {
+		c.ExitAfterDirectReads = true
+	}
+	if fc.DisableStats {
+		c.DisableStats = true
+	}
+	if !c.hasFlag("max-items") && fc.MaxItems != 0 {
+		c.MaxItems = fc.MaxItems
+	}
+	if !c.hasFlag("max-size") && fc.MaxSize != 0 {
+		c.MaxSize = fc.MaxSize
+	}
+	if !c.hasFlag("max-duration") && fc.MaxDuration != "" {
+		c.MaxDuration = fc.MaxDuration
+	}
+	if !c.hasFlag("stats-duration") && fc.StatsDuration != "" {
+		c.StatsDuration = fc.StatsDuration
+	}
+	if !c.hasFlag("indexers") && fc.Indexers > 0 {
+		c.Indexers = fc.Indexers
+	}
+	if len(c.ChangeStreamNs) == 0 {
+		c.ChangeStreamNs = fc.ChangeStreamNs
+	}
+	if len(c.DirectReadNs) == 0 {
+		c.DirectReadNs = fc.DirectReadNs
+	}
+	if !c.hasFlag("direct-read-split-max") && fc.DirectReadSplitMax != 0 {
+		c.DirectReadSplitMax = fc.DirectReadSplitMax
+	}
+	if !c.hasFlag("direct-read-concur") && fc.DirectReadConcur != 0 {
+		c.DirectReadConcur = fc.DirectReadConcur
+	}
+}
+
+func mustConfig() *config {
+	conf, err := loadConfig()
+	if err != nil {
+		errorLog.Fatalf("Configuration failed: %s", err)
+		return nil
+	}
+	return conf
+}
+
+func parseFlags() *config {
+	var c config
+	var v bool
+	flag.BoolVar(&v, "version", false, "Print the version number and exit")
+	flag.BoolVar(&v, "v", false, "Print the version number and exit")
+	flag.StringVar(&c.ConfigFile, "f", "", "Path to a TOML formatted config file")
+	flag.StringVar(&c.MongoURI, "mongo", "mongodb://localhost:27017",
+		"MongoDB connection string URI")
+	flag.StringVar(&c.RedisearchAddrs, "redisearch", "localhost:6379",
+		"Comma separated list of RediSearch host:port pairs")
+	flag.BoolVar(&c.DisableCreateIndex, "disable-create-index", false,
+		"True to disable auto-create attempts for missing RediSearch indexes")
+	flag.BoolVar(&c.FailFast, "fail-fast", false,
+		"True to exit the process after the first connection failure")
+	flag.BoolVar(&c.ExitAfterDirectReads, "exit-after-direct-reads", false,
+		"True to exit the process after direct reads have completed")
+	flag.BoolVar(&c.DisableStats, "disable-stats", false,
+		"True to disable periodic logging of indexing stats")
+	flag.IntVar(&c.MaxItems, "max-items", 1000,
+		"The max number of documents each indexer will buffer before forcing a flush")
+	flag.Int64Var(&c.MaxSize, "max-size", 0,
+		"The max number of bytes each indexer will accrue before forcing a flush")
+	flag.StringVar(&c.MaxDuration, "max-duration", "1s",
+		"The max duration each indexer will wait before forcing a flush")
+	flag.StringVar(&c.StatsDuration, "stats-duration", "10s",
+		"The max duration to wait before logging indexing stats")
+	flag.IntVar(&c.Indexers, "indexers", 4,
+		"The number of go routines concurrently indexing documents")
+	flag.Var(&c.ChangeStreamNs, "change-stream-namespace", "MongoDB namespace to watch for changes")
+	flag.Var(&c.DirectReadNs, "direct-read-namespace", "MongoDB namespace to read and sync")
+	flag.IntVar(&c.DirectReadSplitMax, "direct-read-split-max", 9,
+		"The max number of times to split each collection for concurrent reads")
+	flag.IntVar(&c.DirectReadConcur, "direct-read-concur", 4,
+		"The max number collections to read concurrently")
+	flag.Parse()
+	if v {
+		fmt.Println(version)
+		os.Exit(0)
+	}
+	return &c
+}
+
+func loadConfig() (*config, error) {
+	c := parseFlags()
+	if c.ConfigFile != "" {
+		var fc config
+		if md, err := toml.DecodeFile(c.ConfigFile, &fc); err != nil {
+			return nil, err
+		} else if ud := md.Undecoded(); len(ud) != 0 {
+			return nil, fmt.Errorf("Config file contains undecoded keys: %q", ud)
+		}
+		c.override(&fc)
+	}
+	if err := c.setDefaults().validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 type indexStats struct {
 	Total      int64
 	Indexed    int64
+	Deleted    int64
 	Failed     int64
 	Flushed    int64
 	sync.Mutex `json:"-"`
@@ -54,9 +250,10 @@ type indexBuffer struct {
 
 type indexWorker struct {
 	client      *redisearch.Client
+	config      *config
 	namespace   string
 	workQ       chan *gtm.Op
-	buffers     int
+	indexers    int
 	maxDuration time.Duration
 	maxItems    int
 	maxSize     int64
@@ -65,9 +262,11 @@ type indexWorker struct {
 	logs        *loggers
 	stats       *indexStats
 	createIndex bool
+	buffers     []*indexBuffer
 }
 
 type indexClient struct {
+	config        *config
 	readC         chan bool
 	readContext   *gtm.OpCtx
 	addrs         string
@@ -82,6 +281,16 @@ type indexClient struct {
 	stats         *indexStats
 	createIndex   bool
 	statsDuration time.Duration
+	indexers      int
+}
+
+func (args *stringargs) String() string {
+	return fmt.Sprintf("%s", *args)
+}
+
+func (args *stringargs) Set(value string) error {
+	*args = append(*args, value)
+	return nil
 }
 
 func opIDToString(op *gtm.Op) (id string) {
@@ -115,6 +324,7 @@ func (is *indexStats) dup() *indexStats {
 		Total:   is.Total,
 		Flushed: is.Flushed,
 		Indexed: is.Indexed,
+		Deleted: is.Deleted,
 		Failed:  is.Failed,
 	}
 }
@@ -137,10 +347,36 @@ func (is *indexStats) addIndexed(count int) {
 	is.Indexed += int64(count)
 }
 
+func (is *indexStats) addDeleted(count int) {
+	is.Lock()
+	defer is.Unlock()
+	is.Deleted += int64(count)
+}
+
 func (is *indexStats) addFailed(count int) {
 	is.Lock()
 	defer is.Unlock()
 	is.Failed += int64(count)
+}
+
+func (ib *indexBuffer) flatmap(prefix string, e map[string]interface{}) map[string]interface{} {
+	o := make(map[string]interface{})
+	for k, v := range e {
+		switch child := v.(type) {
+		case []interface{}:
+			break
+		case map[string]interface{}:
+			nm := ib.flatmap("", child)
+			for nk, nv := range nm {
+				o[prefix+k+"."+nk] = nv
+			}
+		case time.Time:
+			o[prefix+k] = child.Unix()
+		default:
+			o[prefix+k] = v
+		}
+	}
+	return o
 }
 
 func (ib *indexBuffer) createDoc(op *gtm.Op) redisearch.Document {
@@ -151,8 +387,18 @@ func (ib *indexBuffer) createDoc(op *gtm.Op) redisearch.Document {
 			continue
 		}
 		switch val := v.(type) {
-		case map[string]interface{}, []interface{}:
-			continue
+		case []interface{}:
+			break
+		case map[string]interface{}:
+			flat := ib.flatmap(k+".", val)
+			for fk, fv := range flat {
+				switch fval := fv.(type) {
+				case time.Time:
+					doc.Set(fk, fval.Unix())
+				default:
+					doc.Set(fk, fv)
+				}
+			}
 		case time.Time:
 			doc.Set(k, val.Unix())
 		default:
@@ -172,9 +418,19 @@ func (ib *indexBuffer) toSchema() *redisearch.Schema {
 		return sc
 	}
 	for k, v := range item.Properties {
-		switch v.(type) {
-		case map[string]interface{}, []interface{}:
+		switch val := v.(type) {
+		case []interface{}:
 			break
+		case map[string]interface{}:
+			flat := ib.flatmap(k+".", val)
+			for fk, fv := range flat {
+				switch fv.(type) {
+				case time.Time, int, int32, int64, float32, float64:
+					sc.AddField(redisearch.NewNumericField(fk))
+				default:
+					sc.AddField(redisearch.NewTextField(fk))
+				}
+			}
 		case time.Time, int, int32, int64, float32, float64:
 			sc.AddField(redisearch.NewNumericField(k))
 		default:
@@ -202,7 +458,7 @@ func (ib *indexBuffer) afterFlush(err error) {
 
 func (ib *indexBuffer) logIndexInfo(indexInfo *redisearch.IndexInfo) {
 	if b, err := json.Marshal(indexInfo); err == nil {
-		ib.logs.infoLog.Printf("Auto created index: %s", string(b))
+		ib.logs.infoLog.Printf("Auto created index with schema: %s", string(b))
 	}
 }
 
@@ -227,7 +483,9 @@ func (ib *indexBuffer) flush() (err error) {
 	client := ib.worker.client
 	indexOptions := redisearch.IndexingOptions{Replace: true}
 	err = client.IndexOptions(indexOptions, docs...)
-	if err != nil {
+	if err != nil && ib.worker.config.DisableCreateIndex == false {
+		// attempt to create schema and index on the fly
+		// then retry indexing once
 		_, err = client.Info()
 		if err != nil && ib.createIndex {
 			if indexInfo, cie := ib.autoCreateIndex(); cie == nil {
@@ -261,9 +519,14 @@ func (ib *indexBuffer) indexFailed(err error) {
 }
 
 func (ib *indexBuffer) addItem(op *gtm.Op) {
+	if op.Data == nil {
+		return
+	}
 	doc := ib.createDoc(op)
 	ib.items = append(ib.items, doc)
-	ib.curSize += int64(doc.EstimateSize())
+	if ib.maxSize != 0 {
+		ib.curSize += int64(doc.EstimateSize())
+	}
 	if ib.full() {
 		if err := ib.flush(); err != nil {
 			ib.indexFailed(err)
@@ -294,7 +557,7 @@ func (ib *indexBuffer) run() {
 }
 
 func (iw *indexWorker) start() {
-	for i := 0; i < iw.buffers; i++ {
+	for i := 0; i < iw.indexers; i++ {
 		iw.allWg.Add(1)
 		buf := &indexBuffer{
 			worker:      iw,
@@ -306,41 +569,66 @@ func (iw *indexWorker) start() {
 			stats:       iw.stats,
 			createIndex: iw.createIndex,
 		}
+		iw.buffers = append(iw.buffers, buf)
 		go buf.run()
 	}
 }
 
-func (ic *indexWorker) add(op *gtm.Op) *indexWorker {
-	ic.workQ <- op
-	return ic
+func (iw *indexWorker) add(op *gtm.Op) *indexWorker {
+	iw.workQ <- op
+	return iw
+}
+
+func (iw *indexWorker) remove(op *gtm.Op) *indexWorker {
+	// since there are no version numbers to maintain sequence do the best we can.
+	// flush all pending index requests and immediately do the delete
+	for _, ib := range iw.buffers {
+		if err := ib.flush(); err != nil {
+			ib.indexFailed(err)
+		}
+	}
+	client := iw.client
+	docId := opIDToString(op)
+	iw.stats.addTotal(1)
+	if err := client.Delete(docId, true); err == nil {
+		iw.stats.addDeleted(1)
+	} else {
+		iw.stats.addFailed(1)
+		iw.logs.errorLog.Printf("Delete failed: %s", err)
+	}
+	return iw
 }
 
 func newLoggers() *loggers {
 	return &loggers{
-		infoLog:  log.New(os.Stdout, "INFO ", log.Flags()),
-		warnLog:  log.New(os.Stdout, "WARN ", log.Flags()),
-		statsLog: log.New(os.Stdout, "STATS ", log.Flags()),
-		traceLog: log.New(os.Stdout, "TRACE ", log.Flags()),
-		errorLog: log.New(os.Stderr, "ERROR ", log.Flags()),
+		infoLog:  infoLog,
+		warnLog:  warnLog,
+		statsLog: statsLog,
+		traceLog: traceLog,
+		errorLog: errorLog,
 	}
 }
 
-func newIndexClient(ctx *gtm.OpCtx) *indexClient {
+func newIndexClient(ctx *gtm.OpCtx, conf *config) *indexClient {
+	maxDuration, _ := time.ParseDuration(conf.MaxDuration)
+	statsDuration, _ := time.ParseDuration(conf.StatsDuration)
 	return &indexClient{
+		config:        conf,
+		indexers:      conf.Indexers,
 		readC:         make(chan bool),
 		readContext:   ctx,
 		allWg:         &sync.WaitGroup{},
 		stopC:         make(chan bool),
-		addrs:         "localhost:6379",
+		addrs:         conf.RedisearchAddrs,
 		redisClients:  make(map[string]*redisearch.Client),
 		workers:       make(map[string]*indexWorker),
-		maxDuration:   time.Duration(1) * time.Second,
-		maxItems:      1000,
-		maxSize:       0,
+		maxDuration:   maxDuration,
+		maxItems:      conf.MaxItems,
+		maxSize:       conf.MaxSize,
 		logs:          newLoggers(),
 		stats:         &indexStats{},
 		createIndex:   true,
-		statsDuration: time.Duration(10) * time.Second,
+		statsDuration: statsDuration,
 	}
 }
 
@@ -362,11 +650,14 @@ func (ic *indexClient) sigListen() {
 func (ic *indexClient) logStats() {
 	stats := ic.stats.dup()
 	if b, err := json.Marshal(stats); err == nil {
-		ic.logs.infoLog.Printf("Indexing stats: %s", string(b))
+		ic.logs.statsLog.Println(string(b))
 	}
 }
 
 func (ic *indexClient) statsLoop() {
+	if ic.config.DisableStats {
+		return
+	}
 	heartBeat := time.NewTicker(ic.statsDuration)
 	defer heartBeat.Stop()
 	done := false
@@ -381,8 +672,22 @@ func (ic *indexClient) statsLoop() {
 	}
 }
 
+func (ic *indexClient) readListen() {
+	conf := ic.config
+	if len(conf.DirectReadNs) > 0 {
+		ic.readContext.DirectReadWg.Wait()
+		infoLog.Println("Direct reads completed")
+		if conf.ExitAfterDirectReads {
+			ic.logs.infoLog.Println("Shutting down")
+			ic.stop()
+			os.Exit(0)
+		}
+	}
+}
+
 func (client *indexClient) eventLoop() {
 	go client.sigListen()
+	go client.readListen()
 	go client.statsLoop()
 	ctx := client.readContext
 	drained := false
@@ -401,7 +706,7 @@ func (client *indexClient) eventLoop() {
 				}
 				break
 			}
-			client.add(op)
+			client.queue(op)
 		}
 	}
 }
@@ -416,6 +721,31 @@ func (ic *indexClient) setCreateIndex(b bool) *indexClient {
 	return ic
 }
 
+func (ic *indexClient) setIndexers(count int) *indexClient {
+	ic.indexers = count
+	return ic
+}
+
+func (ic *indexClient) setMaxItems(max int) *indexClient {
+	ic.maxItems = max
+	return ic
+}
+
+func (ic *indexClient) setMaxSize(max int64) *indexClient {
+	ic.maxSize = max
+	return ic
+}
+
+func (ic *indexClient) setMaxDuration(max time.Duration) *indexClient {
+	ic.maxDuration = max
+	return ic
+}
+
+func (ic *indexClient) setStatsDuration(max time.Duration) *indexClient {
+	ic.statsDuration = max
+	return ic
+}
+
 func (ic *indexClient) stop() {
 	ic.readContext.Stop()
 	<-ic.readC
@@ -423,7 +753,7 @@ func (ic *indexClient) stop() {
 	ic.allWg.Wait()
 }
 
-func (ic *indexClient) add(op *gtm.Op) *indexClient {
+func (ic *indexClient) queue(op *gtm.Op) *indexClient {
 	ns := op.Namespace
 	c := ic.redisClients[ns]
 	if c == nil {
@@ -433,8 +763,9 @@ func (ic *indexClient) add(op *gtm.Op) *indexClient {
 	worker := ic.workers[ns]
 	if worker == nil {
 		worker = &indexWorker{
+			config:      ic.config,
 			client:      c,
-			buffers:     4,
+			indexers:    ic.indexers,
 			namespace:   op.Namespace,
 			maxDuration: ic.maxDuration,
 			maxItems:    ic.maxItems,
@@ -449,7 +780,11 @@ func (ic *indexClient) add(op *gtm.Op) *indexClient {
 		ic.workers[ns] = worker
 		worker.start()
 	}
-	worker.add(op)
+	if op.IsInsert() || op.IsUpdate() {
+		worker.add(op)
+	} else if op.IsDelete() {
+		worker.remove(op)
+	}
 	return ic
 }
 
@@ -465,27 +800,59 @@ func dialMongo(URI string) (*mongo.Client, error) {
 	clientOptions.ApplyURI(URI)
 	client, err := mongo.NewClient(clientOptions)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("MongoDB connection failed: %s", err)
 	}
-	ctxm, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	if err = client.Connect(ctxm); err != nil {
-		return nil, err
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel1()
+	if err = client.Connect(ctx1); err != nil {
+		return nil, fmt.Errorf("MongoDB connection failed: %s", err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	if err = client.Ping(ctx2, nil); err != nil {
+		return nil, fmt.Errorf("MongoDB connection failed: %s", err)
 	}
 	return client, nil
 }
 
-func main() {
-	var errorLog = log.New(os.Stderr, "ERROR ", log.Flags())
-	client, err := dialMongo("mongodb://localhost:27017")
-	if err != nil {
-		errorLog.Fatalf("MongoDB connection failed: %s", err)
+func mustConnect(conf *config) *mongo.Client {
+	var (
+		client    *mongo.Client
+		connected bool
+		err       error
+	)
+	for !connected {
+		client, err = dialMongo(conf.MongoURI)
+		if err == nil {
+			connected = true
+		} else {
+			if conf.FailFast {
+				errorLog.Fatalf("MongoDB connection failed: %s", err)
+				break
+			} else {
+				errorLog.Println(err)
+			}
+		}
 	}
+	return client
+}
+
+func main() {
+	var (
+		client *mongo.Client
+		conf   *config
+	)
+	conf = mustConfig()
+	conf.log(infoLog)
+	client = mustConnect(conf)
 	defer client.Disconnect(context.Background())
 	ctx := gtm.Start(client, &gtm.Options{
-		ChangeStreamNs: []string{""},
-		OpLogDisabled:  true,
+		ChangeStreamNs:     conf.ChangeStreamNs,
+		DirectReadNs:       conf.DirectReadNs,
+		DirectReadConcur:   conf.DirectReadConcur,
+		DirectReadSplitMax: int32(conf.DirectReadSplitMax),
+		OpLogDisabled:      true,
 	})
-	indexClient := newIndexClient(ctx)
+	indexClient := newIndexClient(ctx, conf)
 	indexClient.eventLoop()
 }

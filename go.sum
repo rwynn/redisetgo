@@ -1,5 +1,7 @@
-github.com/RedisLabs/redisearch-go v0.1.0 h1:3KsEcGVzMbco9UUHL6X+zzppTjCC1/44ti4lvsHDjPc=
-github.com/RedisLabs/redisearch-go v0.1.0/go.mod h1:nfdAmvBS9FnRu/8jtG22Zx6zr2QqRAlCODYplA+gXl0=
+github.com/BurntSushi/toml v0.3.1 h1:WXkYYl6Yr3qBf1K79EBnL4mak0OimBfB0XUf9Vl28OQ=
+github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
+github.com/RediSearch/redisearch-go v0.1.1-0.20190417130439-868a31a6f032 h1:4/G6ESt0Cs0uosrfZzSWw6PVgC+KU0SLOvJtM4qQTvI=
+github.com/RediSearch/redisearch-go v0.1.1-0.20190417130439-868a31a6f032/go.mod h1:6YJdUHnJyl420IOge7s1257XQaeMI14Hqol5pHLjO7k=
 github.com/davecgh/go-spew v1.1.0 h1:ZDRjVQ15GmhC3fiQ8ni8+OwkZQO4DARzQgrnXU1Liz8=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/garyburd/redigo v1.6.0 h1:0VruCpn7yAIIu7pWVClQC8wxCJEcG3nyzpMSHKi1PQc=

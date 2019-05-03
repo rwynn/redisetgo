@@ -3,7 +3,8 @@ module github.com/rwynn/redisetgo
 go 1.12
 
 require (
-	github.com/RedisLabs/redisearch-go v0.1.0
+	github.com/BurntSushi/toml v0.3.1
+	github.com/RediSearch/redisearch-go v0.1.1-0.20190417130439-868a31a6f032
 	github.com/garyburd/redigo v1.6.0 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/golang/snappy v0.0.1 // indirect
