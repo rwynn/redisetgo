@@ -449,8 +449,16 @@ func (ib *indexBuffer) afterFlush(err error) {
 	}
 	multiError, ok := err.(redisearch.MultiError)
 	if ok {
-		ib.stats.addFailed(len(multiError))
-		ib.stats.addIndexed(len(ib.items) - len(multiError))
+		var failed, indexed int
+		for _, e := range multiError {
+			if e == nil {
+				indexed++
+			} else {
+				failed++
+			}
+		}
+		ib.stats.addFailed(failed)
+		ib.stats.addIndexed(indexed)
 	} else {
 		ib.stats.addFailed(len(ib.items))
 	}
