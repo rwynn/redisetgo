@@ -244,7 +244,6 @@ type indexBuffer struct {
 	retryDuration time.Duration
 	logs          *loggers
 	stats         *indexStats
-	createIndex   bool
 	curSize       int64
 }
 
@@ -491,11 +490,10 @@ func (ib *indexBuffer) flush() (err error) {
 	client := ib.worker.client
 	indexOptions := redisearch.IndexingOptions{Replace: true}
 	err = client.IndexOptions(indexOptions, docs...)
-	if err != nil && ib.worker.config.DisableCreateIndex == false {
+	if err != nil && ib.worker.createIndex {
 		// attempt to create schema and index on the fly
 		// then retry indexing once
-		_, err = client.Info()
-		if err != nil && ib.createIndex {
+		if _, ie := client.Info(); ie != nil {
 			if indexInfo, cie := ib.autoCreateIndex(); cie == nil {
 				ib.logIndexInfo(indexInfo)
 			}
@@ -575,7 +573,6 @@ func (iw *indexWorker) start() {
 			stopC:       iw.stopC,
 			logs:        iw.logs,
 			stats:       iw.stats,
-			createIndex: iw.createIndex,
 		}
 		iw.buffers = append(iw.buffers, buf)
 		go buf.run()
@@ -620,6 +617,7 @@ func newLoggers() *loggers {
 func newIndexClient(ctx *gtm.OpCtx, conf *config) *indexClient {
 	maxDuration, _ := time.ParseDuration(conf.MaxDuration)
 	statsDuration, _ := time.ParseDuration(conf.StatsDuration)
+	createIndex := conf.DisableCreateIndex == false
 	return &indexClient{
 		config:        conf,
 		indexers:      conf.Indexers,
@@ -635,7 +633,7 @@ func newIndexClient(ctx *gtm.OpCtx, conf *config) *indexClient {
 		maxSize:       conf.MaxSize,
 		logs:          newLoggers(),
 		stats:         &indexStats{},
-		createIndex:   true,
+		createIndex:   createIndex,
 		statsDuration: statsDuration,
 	}
 }
