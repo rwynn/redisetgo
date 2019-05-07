@@ -8,6 +8,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/RediSearch/redisearch-go/redisearch"
 	"github.com/rwynn/gtm"
+	"github.com/rwynn/redisetgo/module"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
@@ -17,6 +18,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"plugin"
 	"reflect"
 	"sync"
 	"syscall"
@@ -37,6 +39,32 @@ var (
 
 type stringargs []string
 
+type defaultHandler struct{}
+
+func (df *defaultHandler) OnInsert(ev *module.InsertEvent) (*module.IndexResponse, error) {
+	doc := createDoc(ev.Event)
+	return &module.IndexResponse{
+		ToIndex:  []redisearch.Document{doc},
+		Finished: true,
+	}, nil
+}
+
+func (df *defaultHandler) OnUpdate(ev *module.UpdateEvent) (*module.IndexResponse, error) {
+	doc := createDoc(ev.Event)
+	return &module.IndexResponse{
+		ToIndex:  []redisearch.Document{doc},
+		Finished: true,
+	}, nil
+}
+
+func (df *defaultHandler) OnDelete(ev *module.DeleteEvent) (*module.DeleteResponse, error) {
+	docId := opIDToString(ev.Event)
+	return &module.DeleteResponse{
+		ToDelete: []string{docId},
+		Finished: true,
+	}, nil
+}
+
 type config struct {
 	ConfigFile           string
 	MongoURI             string     `toml:"mongo"`
@@ -54,6 +82,8 @@ type config struct {
 	FailFast             bool       `toml:"fail-fast"`
 	ExitAfterDirectReads bool       `toml:"exit-after-direct-reads"`
 	DisableStats         bool       `toml:"disable-stats"`
+	PluginFiles          stringargs `toml:"plugins"`
+	plugins              []module.Plugin
 }
 
 func (c *config) hasFlag(name string) bool {
@@ -79,6 +109,7 @@ func (c *config) setDefaults() *config {
 	if len(c.DirectReadNs) == 0 {
 		c.DirectReadNs = []string{}
 	}
+	c.plugins = append(c.plugins, &defaultHandler{})
 	return c
 }
 
@@ -140,6 +171,9 @@ func (c *config) override(fc *config) {
 	if len(c.DirectReadNs) == 0 {
 		c.DirectReadNs = fc.DirectReadNs
 	}
+	if len(c.PluginFiles) == 0 {
+		c.PluginFiles = fc.PluginFiles
+	}
 	if !c.hasFlag("direct-read-split-max") && fc.DirectReadSplitMax != 0 {
 		c.DirectReadSplitMax = fc.DirectReadSplitMax
 	}
@@ -187,6 +221,7 @@ func parseFlags() *config {
 		"The number of go routines concurrently indexing documents")
 	flag.Var(&c.ChangeStreamNs, "change-stream-namespace", "MongoDB namespace to watch for changes")
 	flag.Var(&c.DirectReadNs, "direct-read-namespace", "MongoDB namespace to read and sync")
+	flag.Var(&c.PluginFiles, "plugin", "Path to .so redisetgo plugin file to load")
 	flag.IntVar(&c.DirectReadSplitMax, "direct-read-split-max", 9,
 		"The max number of times to split each collection for concurrent reads")
 	flag.IntVar(&c.DirectReadConcur, "direct-read-concur", 4,
@@ -209,6 +244,28 @@ func loadConfig() (*config, error) {
 			return nil, fmt.Errorf("Config file contains undecoded keys: %q", ud)
 		}
 		c.override(&fc)
+	}
+	if len(c.PluginFiles) > 0 {
+		for _, pf := range c.PluginFiles {
+			p, err := plugin.Open(pf)
+			if err != nil {
+				return nil, fmt.Errorf("Unable to load plugin %s: %s", pf, err)
+			}
+			ps, err := p.Lookup("Plugins")
+			if err != nil {
+				return nil, fmt.Errorf("Symbol `Plugins` not found in plugin %s", pf)
+			}
+			var pfunc module.PluginEntry
+			var ok bool
+			pfunc, ok = ps.(module.PluginEntry)
+			if !ok {
+				return nil, fmt.Errorf("Symbol `Plugins` must be of type %T", pfunc)
+			}
+			pints := pfunc()
+			for _, pint := range pints {
+				c.plugins = append(c.plugins, pint)
+			}
+		}
 	}
 	if err := c.setDefaults().validate(); err != nil {
 		return nil, err
@@ -358,14 +415,14 @@ func (is *indexStats) addFailed(count int) {
 	is.Failed += int64(count)
 }
 
-func (ib *indexBuffer) flatmap(prefix string, e map[string]interface{}) map[string]interface{} {
+func flatmap(prefix string, e map[string]interface{}) map[string]interface{} {
 	o := make(map[string]interface{})
 	for k, v := range e {
 		switch child := v.(type) {
 		case []interface{}:
 			break
 		case map[string]interface{}:
-			nm := ib.flatmap("", child)
+			nm := flatmap("", child)
 			for nk, nv := range nm {
 				o[prefix+k+"."+nk] = nv
 			}
@@ -378,7 +435,7 @@ func (ib *indexBuffer) flatmap(prefix string, e map[string]interface{}) map[stri
 	return o
 }
 
-func (ib *indexBuffer) createDoc(op *gtm.Op) redisearch.Document {
+func createDoc(op *gtm.Op) redisearch.Document {
 	docId := opIDToString(op)
 	doc := redisearch.NewDocument(docId, 1.0)
 	for k, v := range op.Data {
@@ -389,7 +446,7 @@ func (ib *indexBuffer) createDoc(op *gtm.Op) redisearch.Document {
 		case []interface{}:
 			break
 		case map[string]interface{}:
-			flat := ib.flatmap(k+".", val)
+			flat := flatmap(k+".", val)
 			for fk, fv := range flat {
 				switch fval := fv.(type) {
 				case time.Time:
@@ -421,7 +478,7 @@ func (ib *indexBuffer) toSchema() *redisearch.Schema {
 		case []interface{}:
 			break
 		case map[string]interface{}:
-			flat := ib.flatmap(k+".", val)
+			flat := flatmap(k+".", val)
 			for fk, fv := range flat {
 				switch fv.(type) {
 				case time.Time, int, int32, int64, float32, float64:
@@ -524,11 +581,7 @@ func (ib *indexBuffer) indexFailed(err error) {
 	ib.logs.errorLog.Printf("Indexing failed: %s", err)
 }
 
-func (ib *indexBuffer) addItem(op *gtm.Op) {
-	if op.Data == nil {
-		return
-	}
-	doc := ib.createDoc(op)
+func (ib *indexBuffer) addItem(doc redisearch.Document) {
 	ib.items = append(ib.items, doc)
 	if ib.maxSize != 0 {
 		ib.curSize += int64(doc.EstimateSize())
@@ -540,6 +593,125 @@ func (ib *indexBuffer) addItem(op *gtm.Op) {
 	}
 }
 
+func (ib *indexBuffer) handleInsert(op *gtm.Op) {
+	if op.Data == nil {
+		errorLog.Println("Insert event had no associated data")
+		return
+	}
+	config := ib.worker.config
+	for _, plugin := range config.plugins {
+		req := &module.InsertEvent{}
+		req.MongoClient = nil
+		req.RedisSearchClient = ib.worker.client
+		req.Event = op
+		req.Logs = &module.Loggers{
+			InfoLog:  infoLog,
+			WarnLog:  warnLog,
+			TraceLog: traceLog,
+			ErrorLog: errorLog,
+		}
+		resp, err := plugin.OnInsert(req)
+		if err != nil {
+			errorLog.Printf("Insert handler returned error: %s", err)
+			break
+		}
+		if resp != nil {
+			docs := resp.ToIndex
+			if docs != nil {
+				for _, doc := range docs {
+					ib.addItem(doc)
+				}
+			}
+			if resp.Finished {
+				break
+			}
+		}
+	}
+}
+
+func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
+	if op.Data == nil {
+		errorLog.Println("Update event had no associated data")
+		return
+	}
+	config := ib.worker.config
+	for _, plugin := range config.plugins {
+		req := &module.UpdateEvent{}
+		req.MongoClient = nil
+		req.RedisSearchClient = ib.worker.client
+		req.Event = op
+		req.Logs = &module.Loggers{
+			InfoLog:  infoLog,
+			WarnLog:  warnLog,
+			TraceLog: traceLog,
+			ErrorLog: errorLog,
+		}
+		resp, err := plugin.OnUpdate(req)
+		if err != nil {
+			errorLog.Printf("Update handler returned error: %s", err)
+			break
+		}
+		if resp != nil {
+			docs := resp.ToIndex
+			if docs != nil {
+				for _, doc := range docs {
+					ib.addItem(doc)
+				}
+			}
+			if resp.Finished {
+				break
+			}
+		}
+	}
+}
+
+func (iw *indexWorker) handleDelete(op *gtm.Op) {
+	config := iw.config
+	client := iw.client
+	for _, plugin := range config.plugins {
+		req := &module.DeleteEvent{}
+		req.MongoClient = nil
+		req.RedisSearchClient = client
+		req.Event = op
+		req.Logs = &module.Loggers{
+			InfoLog:  infoLog,
+			WarnLog:  warnLog,
+			TraceLog: traceLog,
+			ErrorLog: errorLog,
+		}
+		resp, err := plugin.OnDelete(req)
+		if err != nil {
+			errorLog.Printf("Delete handler returned error: %s", err)
+			break
+		}
+		if resp != nil {
+			docIds := resp.ToDelete
+			if docIds != nil {
+				for _, docId := range docIds {
+					iw.stats.addTotal(1)
+					if err := client.Delete(docId, true); err == nil {
+						iw.stats.addDeleted(1)
+					} else {
+						iw.stats.addFailed(1)
+						iw.logs.errorLog.Printf("Delete of document ID %s failed: %s", docId, err)
+					}
+				}
+			}
+			if resp.Finished {
+				break
+			}
+		}
+	}
+}
+
+func (ib *indexBuffer) handleEvent(op *gtm.Op) {
+	if op.IsInsert() {
+		ib.handleInsert(op)
+	} else {
+		ib.handleUpdate(op)
+	}
+}
+
 func (ib *indexBuffer) run() {
 	defer ib.worker.allWg.Done()
 	timer := time.NewTicker(ib.maxDuration)
@@ -548,7 +720,7 @@ func (ib *indexBuffer) run() {
 	for !done {
 		select {
 		case op := <-ib.worker.workQ:
-			ib.addItem(op)
+			ib.handleEvent(op)
 		case <-timer.C:
 			if err := ib.flush(); err != nil {
 				ib.indexFailed(err)
@@ -592,15 +764,7 @@ func (iw *indexWorker) remove(op *gtm.Op) *indexWorker {
 			ib.indexFailed(err)
 		}
 	}
-	client := iw.client
-	docId := opIDToString(op)
-	iw.stats.addTotal(1)
-	if err := client.Delete(docId, true); err == nil {
-		iw.stats.addDeleted(1)
-	} else {
-		iw.stats.addFailed(1)
-		iw.logs.errorLog.Printf("Delete failed: %s", err)
-	}
+	iw.handleDelete(op)
 	return iw
 }
 
