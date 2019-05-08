@@ -39,10 +39,20 @@ var (
 
 type stringargs []string
 
-type defaultHandler struct{}
+type defaultHandler struct {
+	name string
+}
+
+func (df *defaultHandler) Name() string {
+	return df.name
+}
+
+func (df *defaultHandler) Handles(ev *module.Event) bool {
+	return true
+}
 
 func (df *defaultHandler) OnInsert(ev *module.InsertEvent) (*module.IndexResponse, error) {
-	doc := createDoc(ev.Event)
+	doc := createDoc(ev.Op)
 	return &module.IndexResponse{
 		ToIndex:  []redisearch.Document{doc},
 		Finished: true,
@@ -50,7 +60,7 @@ func (df *defaultHandler) OnInsert(ev *module.InsertEvent) (*module.IndexRespons
 }
 
 func (df *defaultHandler) OnUpdate(ev *module.UpdateEvent) (*module.IndexResponse, error) {
-	doc := createDoc(ev.Event)
+	doc := createDoc(ev.Op)
 	return &module.IndexResponse{
 		ToIndex:  []redisearch.Document{doc},
 		Finished: true,
@@ -58,32 +68,38 @@ func (df *defaultHandler) OnUpdate(ev *module.UpdateEvent) (*module.IndexRespons
 }
 
 func (df *defaultHandler) OnDelete(ev *module.DeleteEvent) (*module.DeleteResponse, error) {
-	docId := opIDToString(ev.Event)
+	docId := opIDToString(ev.Op)
 	return &module.DeleteResponse{
 		ToDelete: []string{docId},
 		Finished: true,
 	}, nil
 }
 
+type eventHandlerRef struct {
+	path string
+	impl module.EventHandler
+}
+
 type config struct {
-	ConfigFile           string
-	MongoURI             string     `toml:"mongo"`
-	RedisearchAddrs      string     `toml:"redisearch"`
-	DisableCreateIndex   bool       `toml:"disable-create-index"`
-	MaxItems             int        `toml:"max-items"`
-	MaxSize              int64      `toml:"max-size"`
-	MaxDuration          string     `toml:"max-duration"`
-	StatsDuration        string     `toml:"stats-duration"`
-	Indexers             int        `toml:"indexers"`
-	ChangeStreamNs       stringargs `toml:"change-stream-namespaces"`
-	DirectReadNs         stringargs `toml:"direct-read-namespaces"`
-	DirectReadSplitMax   int        `toml:"direct-read-split-max"`
-	DirectReadConcur     int        `toml:"direct-read-concur"`
-	FailFast             bool       `toml:"fail-fast"`
-	ExitAfterDirectReads bool       `toml:"exit-after-direct-reads"`
-	DisableStats         bool       `toml:"disable-stats"`
-	PluginFiles          stringargs `toml:"plugins"`
-	plugins              []module.Plugin
+	ConfigFile           string     `json:"config-file"`
+	MongoURI             string     `toml:"mongo" json:"mongo"`
+	RedisearchAddrs      string     `toml:"redisearch" json:"redisearch"`
+	DisableCreateIndex   bool       `toml:"disable-create-index" json:"disable-create-index"`
+	MaxItems             int        `toml:"max-items" json:"max-items"`
+	MaxSize              int64      `toml:"max-size" json:"max-size"`
+	MaxDuration          string     `toml:"max-duration" json:"max-duration"`
+	StatsDuration        string     `toml:"stats-duration" json:"stats-duration"`
+	Indexers             int        `toml:"indexers" json:"indexers"`
+	ChangeStreamNs       stringargs `toml:"change-stream-namespaces" json:"change-stream-namespaces"`
+	DirectReadNs         stringargs `toml:"direct-read-namespaces" json:"direct-read-namespaces"`
+	DirectReadSplitMax   int        `toml:"direct-read-split-max" json:"direct-read-split-max"`
+	DirectReadConcur     int        `toml:"direct-read-concur" json:"direct-read-concur"`
+	FailFast             bool       `toml:"fail-fast" json:"fail-fast"`
+	ExitAfterDirectReads bool       `toml:"exit-after-direct-reads" json:"exit-after-direct-reads"`
+	DisableStats         bool       `toml:"disable-stats" json:"disable-stats"`
+	PluginFiles          stringargs `toml:"plugins" json:"plugins"`
+	eventHandlers        []eventHandlerRef
+	schemaHandlers       []module.SchemaHandler
 }
 
 func (c *config) hasFlag(name string) bool {
@@ -109,7 +125,17 @@ func (c *config) setDefaults() *config {
 	if len(c.DirectReadNs) == 0 {
 		c.DirectReadNs = []string{}
 	}
-	c.plugins = append(c.plugins, &defaultHandler{})
+	if len(c.schemaHandlers) == 0 {
+		c.schemaHandlers = []module.SchemaHandler{}
+	}
+	if len(c.PluginFiles) == 0 {
+		c.PluginFiles = []string{}
+	}
+	ehr := eventHandlerRef{
+		path: "main",
+		impl: &defaultHandler{name: "redisetgo"},
+	}
+	c.eventHandlers = append(c.eventHandlers, ehr)
 	return c
 }
 
@@ -234,6 +260,39 @@ func parseFlags() *config {
 	return &c
 }
 
+func (c *config) loadPluginFile(pf string) error {
+	p, err := plugin.Open(pf)
+	if err != nil {
+		return fmt.Errorf("Unable to load plugin %s: %s", pf, err)
+	}
+	ps, err := p.Lookup("InitPlugin")
+	if err != nil {
+		return fmt.Errorf("Symbol `InitPlugin` not found in plugin %s", pf)
+	}
+	var pfunc module.PluginInitializer
+	var ok bool
+	pfunc, ok = ps.(module.PluginInitializer)
+	if !ok {
+		return fmt.Errorf("Symbol `InitPlugin` must be type %T but was type %T", pfunc, ps)
+	}
+	plug := pfunc.Get()
+	ehs := plug.Events
+	if ehs != nil {
+		for _, eh := range ehs {
+			ehr := eventHandlerRef{
+				path: pf,
+				impl: eh,
+			}
+			c.eventHandlers = append(c.eventHandlers, ehr)
+		}
+	}
+	sh := plug.Schemas
+	if sh != nil {
+		c.schemaHandlers = append(c.schemaHandlers, sh)
+	}
+	return nil
+}
+
 func loadConfig() (*config, error) {
 	c := parseFlags()
 	if c.ConfigFile != "" {
@@ -247,23 +306,8 @@ func loadConfig() (*config, error) {
 	}
 	if len(c.PluginFiles) > 0 {
 		for _, pf := range c.PluginFiles {
-			p, err := plugin.Open(pf)
-			if err != nil {
-				return nil, fmt.Errorf("Unable to load plugin %s: %s", pf, err)
-			}
-			ps, err := p.Lookup("Plugins")
-			if err != nil {
-				return nil, fmt.Errorf("Symbol `Plugins` not found in plugin %s", pf)
-			}
-			var pfunc module.PluginEntry
-			var ok bool
-			pfunc, ok = ps.(module.PluginEntry)
-			if !ok {
-				return nil, fmt.Errorf("Symbol `Plugins` must be of type %T", pfunc)
-			}
-			pints := pfunc()
-			for _, pint := range pints {
-				c.plugins = append(c.plugins, pint)
+			if err := c.loadPluginFile(pf); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -274,11 +318,11 @@ func loadConfig() (*config, error) {
 }
 
 type indexStats struct {
-	Total      int64
-	Indexed    int64
-	Deleted    int64
-	Failed     int64
-	Flushed    int64
+	Total      int64 `json:"total"`
+	Indexed    int64 `json:"indexed"`
+	Deleted    int64 `json:"deleted"`
+	Failed     int64 `json:"failed"`
+	Flushed    int64 `json:"flushed"`
 	sync.Mutex `json:"-"`
 }
 
@@ -306,6 +350,7 @@ type indexBuffer struct {
 
 type indexWorker struct {
 	client      *redisearch.Client
+	mongoClient *mongo.Client
 	config      *config
 	namespace   string
 	workQ       chan *gtm.Op
@@ -319,9 +364,11 @@ type indexWorker struct {
 	stats       *indexStats
 	createIndex bool
 	buffers     []*indexBuffer
+	schema      *redisearch.Schema
 }
 
 type indexClient struct {
+	mongoClient   *mongo.Client
 	config        *config
 	readC         chan bool
 	readContext   *gtm.OpCtx
@@ -465,7 +512,11 @@ func createDoc(op *gtm.Op) redisearch.Document {
 }
 
 func (ib *indexBuffer) toSchema() *redisearch.Schema {
-	sc := redisearch.NewSchema(redisearch.DefaultOptions)
+	sc := ib.worker.schema
+	if sc != nil {
+		return sc
+	}
+	sc = redisearch.NewSchema(redisearch.DefaultOptions)
 	if len(ib.items) == 0 {
 		return sc
 	}
@@ -520,9 +571,9 @@ func (ib *indexBuffer) afterFlush(err error) {
 	}
 }
 
-func (ib *indexBuffer) logIndexInfo(indexInfo *redisearch.IndexInfo) {
+func logIndexInfo(indexInfo *redisearch.IndexInfo) {
 	if b, err := json.Marshal(indexInfo); err == nil {
-		ib.logs.infoLog.Printf("Auto created index with schema: %s", string(b))
+		infoLog.Printf("Auto created index with schema: %s", string(b))
 	}
 }
 
@@ -552,7 +603,7 @@ func (ib *indexBuffer) flush() (err error) {
 		// then retry indexing once
 		if _, ie := client.Info(); ie != nil {
 			if indexInfo, cie := ib.autoCreateIndex(); cie == nil {
-				ib.logIndexInfo(indexInfo)
+				logIndexInfo(indexInfo)
 			}
 			err = client.IndexOptions(indexOptions, docs...)
 		}
@@ -595,15 +646,22 @@ func (ib *indexBuffer) addItem(doc redisearch.Document) {
 
 func (ib *indexBuffer) handleInsert(op *gtm.Op) {
 	if op.Data == nil {
+		ib.stats.addTotal(1)
+		ib.stats.addFailed(1)
 		errorLog.Println("Insert event had no associated data")
 		return
 	}
 	config := ib.worker.config
-	for _, plugin := range config.plugins {
+	for _, ref := range config.eventHandlers {
+		plugin := ref.impl
+		ev := &module.Event{Op: op}
+		if !plugin.Handles(ev) {
+			continue
+		}
 		req := &module.InsertEvent{}
-		req.MongoClient = nil
+		req.MongoClient = ib.worker.mongoClient
 		req.RedisSearchClient = ib.worker.client
-		req.Event = op
+		req.Op = op
 		req.Logs = &module.Loggers{
 			InfoLog:  infoLog,
 			WarnLog:  warnLog,
@@ -612,7 +670,9 @@ func (ib *indexBuffer) handleInsert(op *gtm.Op) {
 		}
 		resp, err := plugin.OnInsert(req)
 		if err != nil {
-			errorLog.Printf("Insert handler returned error: %s", err)
+			ib.stats.addTotal(1)
+			ib.stats.addFailed(1)
+			errorLog.Printf("Insert handler for plugin %s[%s] returned error: %s", plugin.Name(), ref.path, err)
 			break
 		}
 		if resp != nil {
@@ -631,15 +691,22 @@ func (ib *indexBuffer) handleInsert(op *gtm.Op) {
 
 func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
 	if op.Data == nil {
+		ib.stats.addTotal(1)
+		ib.stats.addFailed(1)
 		errorLog.Println("Update event had no associated data")
 		return
 	}
 	config := ib.worker.config
-	for _, plugin := range config.plugins {
+	for _, ref := range config.eventHandlers {
+		plugin := ref.impl
+		ev := &module.Event{Op: op}
+		if !plugin.Handles(ev) {
+			continue
+		}
 		req := &module.UpdateEvent{}
-		req.MongoClient = nil
+		req.MongoClient = ib.worker.mongoClient
 		req.RedisSearchClient = ib.worker.client
-		req.Event = op
+		req.Op = op
 		req.Logs = &module.Loggers{
 			InfoLog:  infoLog,
 			WarnLog:  warnLog,
@@ -648,7 +715,9 @@ func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
 		}
 		resp, err := plugin.OnUpdate(req)
 		if err != nil {
-			errorLog.Printf("Update handler returned error: %s", err)
+			ib.stats.addTotal(1)
+			ib.stats.addFailed(1)
+			errorLog.Printf("Update handler for plugin %s[%s] returned error: %s", plugin.Name(), ref.path, err)
 			break
 		}
 		if resp != nil {
@@ -668,11 +737,16 @@ func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
 func (iw *indexWorker) handleDelete(op *gtm.Op) {
 	config := iw.config
 	client := iw.client
-	for _, plugin := range config.plugins {
+	for _, ref := range config.eventHandlers {
+		plugin := ref.impl
+		ev := &module.Event{Op: op}
+		if !plugin.Handles(ev) {
+			continue
+		}
 		req := &module.DeleteEvent{}
-		req.MongoClient = nil
+		req.MongoClient = iw.mongoClient
 		req.RedisSearchClient = client
-		req.Event = op
+		req.Op = op
 		req.Logs = &module.Loggers{
 			InfoLog:  infoLog,
 			WarnLog:  warnLog,
@@ -681,7 +755,9 @@ func (iw *indexWorker) handleDelete(op *gtm.Op) {
 		}
 		resp, err := plugin.OnDelete(req)
 		if err != nil {
-			errorLog.Printf("Delete handler returned error: %s", err)
+			iw.stats.addTotal(1)
+			iw.stats.addFailed(1)
+			errorLog.Printf("Delete handler for plugin %s[%s] returned error: %s", plugin.Name(), ref.path, err)
 			break
 		}
 		if resp != nil {
@@ -778,11 +854,12 @@ func newLoggers() *loggers {
 	}
 }
 
-func newIndexClient(ctx *gtm.OpCtx, conf *config) *indexClient {
+func newIndexClient(client *mongo.Client, ctx *gtm.OpCtx, conf *config) *indexClient {
 	maxDuration, _ := time.ParseDuration(conf.MaxDuration)
 	statsDuration, _ := time.ParseDuration(conf.StatsDuration)
 	createIndex := conf.DisableCreateIndex == false
 	return &indexClient{
+		mongoClient:   client,
 		config:        conf,
 		indexers:      conf.Indexers,
 		readC:         make(chan bool),
@@ -809,11 +886,12 @@ func (ic *indexClient) sigListen() {
 	<-sigs
 	go func() {
 		<-sigs
-		ic.logs.infoLog.Println("Forcing shutdown")
+		ic.logs.infoLog.Println("Forcing shutdown, bye bye...")
 		os.Exit(1)
 	}()
 	ic.logs.infoLog.Println("Shutting down")
 	ic.stop()
+	ic.logs.infoLog.Println("Ready to exit, bye bye...")
 	os.Exit(0)
 }
 
@@ -924,10 +1002,47 @@ func (ic *indexClient) stop() {
 }
 
 func (ic *indexClient) queue(op *gtm.Op) *indexClient {
+	var schema *redisearch.Schema
 	ns := op.Namespace
 	c := ic.redisClients[ns]
 	if c == nil {
-		c = redisearch.NewClient(ic.addrs, ns)
+		indexName := ns
+		schemaEvent := &module.SchemaEvent{
+			Namespace: ns,
+		}
+		for _, sh := range ic.config.schemaHandlers {
+			if sh.Handles(schemaEvent) {
+				sr, err := sh.Schema(schemaEvent)
+				if err != nil {
+					errorLog.Printf("Error calling schema handler %s:%s", sh.Name(), err)
+					return ic
+				}
+				if sr != nil {
+					if sr.Index != "" {
+						indexName = sr.Index
+					}
+					if sr.Schema != nil {
+						schema = sr.Schema
+					}
+				}
+				break
+			}
+		}
+		c = redisearch.NewClient(ic.addrs, indexName)
+		if schema != nil {
+			// check and create plugin provided schema
+			_, err := c.Info()
+			if err != nil {
+				var indexInfo *redisearch.IndexInfo
+				if err = c.CreateIndex(schema); err == nil {
+					if indexInfo, err = c.Info(); err == nil {
+						logIndexInfo(indexInfo)
+					}
+				} else {
+					errorLog.Printf("Error creating schema %+v:%s", schema, err)
+				}
+			}
+		}
 		ic.redisClients[ns] = c
 	}
 	worker := ic.workers[ns]
@@ -935,8 +1050,9 @@ func (ic *indexClient) queue(op *gtm.Op) *indexClient {
 		worker = &indexWorker{
 			config:      ic.config,
 			client:      c,
+			mongoClient: ic.mongoClient,
 			indexers:    ic.indexers,
-			namespace:   op.Namespace,
+			namespace:   ns,
 			maxDuration: ic.maxDuration,
 			maxItems:    ic.maxItems,
 			maxSize:     ic.maxSize,
@@ -946,6 +1062,7 @@ func (ic *indexClient) queue(op *gtm.Op) *indexClient {
 			logs:        ic.logs,
 			stats:       ic.stats,
 			createIndex: ic.createIndex,
+			schema:      schema,
 		}
 		ic.workers[ns] = worker
 		worker.start()
@@ -1000,7 +1117,7 @@ func mustConnect(conf *config) *mongo.Client {
 				errorLog.Fatalf("MongoDB connection failed: %s", err)
 				break
 			} else {
-				errorLog.Println(err)
+				errorLog.Printf("MongoDB connection failed: %s", err)
 			}
 		}
 	}
@@ -1014,7 +1131,9 @@ func main() {
 	)
 	conf = mustConfig()
 	conf.log(infoLog)
+	infoLog.Println("Establishing connection to MongoDB")
 	client = mustConnect(conf)
+	infoLog.Println("Connected to MongoDB")
 	defer client.Disconnect(context.Background())
 	ctx := gtm.Start(client, &gtm.Options{
 		ChangeStreamNs:     conf.ChangeStreamNs,
@@ -1023,6 +1142,6 @@ func main() {
 		DirectReadSplitMax: int32(conf.DirectReadSplitMax),
 		OpLogDisabled:      true,
 	})
-	indexClient := newIndexClient(ctx, conf)
+	indexClient := newIndexClient(client, ctx, conf)
 	indexClient.eventLoop()
 }
