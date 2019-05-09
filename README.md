@@ -1,6 +1,6 @@
 # redisetgo
 
-Continuously index your MongoDB data stream in RediSearch.
+Continuously index your MongoDB data stream in [RediSearch](https://redislabs.com/redis-enterprise/technology/redis-search/).
 
 ### testing with docker
 
@@ -41,7 +41,7 @@ Run a query via redis-cli to ensure the indexing was successful
    2) "1"
 ```
 
-### custom modules
+### customize the behavior with modules
 
 You can write you own modules to change the behavior.  See examples/plugin.go for an example.
 
@@ -54,12 +54,23 @@ cd ..
 go run redisetgo.go -plugin examples/examples.so
 ```
 
+In this case we have just one plugin but you can have multiple
+
+```
+go run redisetgo.go -plugin myplugins/p1.so -plugin myplugins/p2.so
+
+```
+
+Test the example plugin by inserting some data into MongoDB
+
 ```
 rs1:PRIMARY> use test;
 switched to db test
-rs1:PRIMARY> db.test.insert({foo: "ok"}) // succeeds
+rs1:PRIMARY> db.test.insert({foo: "ok", bar: "ignored"}) // succeeds
 rs1:PRIMARY> db.test.insert({foo: 1}) // fails as designed
 ```
+
+Search for the data in RediSearch
 
 ```
 127.0.0.1:6379> FT.SEARCH my-index *

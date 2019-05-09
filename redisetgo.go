@@ -16,6 +16,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"plugin"
@@ -88,6 +89,8 @@ type config struct {
 	MaxItems             int        `toml:"max-items" json:"max-items"`
 	MaxSize              int64      `toml:"max-size" json:"max-size"`
 	MaxDuration          string     `toml:"max-duration" json:"max-duration"`
+	MaxRetries           int        `toml:"max-retries" json:"max-retries"`
+	RetryDuration        string     `toml:"retry-duration" json:"retry-duration"`
 	StatsDuration        string     `toml:"stats-duration" json:"stats-duration"`
 	Indexers             int        `toml:"indexers" json:"indexers"`
 	ChangeStreamNs       stringargs `toml:"change-stream-namespaces" json:"change-stream-namespaces"`
@@ -154,6 +157,13 @@ func (c *config) validate() error {
 	} else {
 		return fmt.Errorf("StatsDuration cannot be empty")
 	}
+	if c.RetryDuration != "" {
+		if _, err := time.ParseDuration(c.RetryDuration); err != nil {
+			return fmt.Errorf("Invalid RetryDuration: %s", err)
+		}
+	} else {
+		return fmt.Errorf("RetryDuration cannot be empty")
+	}
 	return nil
 }
 
@@ -182,11 +192,17 @@ func (c *config) override(fc *config) {
 	if !c.hasFlag("max-size") && fc.MaxSize != 0 {
 		c.MaxSize = fc.MaxSize
 	}
+	if !c.hasFlag("max-retries") && fc.MaxRetries != 0 {
+		c.MaxRetries = fc.MaxRetries
+	}
 	if !c.hasFlag("max-duration") && fc.MaxDuration != "" {
 		c.MaxDuration = fc.MaxDuration
 	}
 	if !c.hasFlag("stats-duration") && fc.StatsDuration != "" {
 		c.StatsDuration = fc.StatsDuration
+	}
+	if !c.hasFlag("retry-duration") && fc.RetryDuration != "" {
+		c.RetryDuration = fc.RetryDuration
 	}
 	if !c.hasFlag("indexers") && fc.Indexers > 0 {
 		c.Indexers = fc.Indexers
@@ -235,6 +251,8 @@ func parseFlags() *config {
 		"True to exit the process after direct reads have completed")
 	flag.BoolVar(&c.DisableStats, "disable-stats", false,
 		"True to disable periodic logging of indexing stats")
+	flag.IntVar(&c.MaxRetries, "max-retries", 10,
+		"The max number of times an indexing request will be retried on a network failure")
 	flag.IntVar(&c.MaxItems, "max-items", 1000,
 		"The max number of documents each indexer will buffer before forcing a flush")
 	flag.Int64Var(&c.MaxSize, "max-size", 0,
@@ -243,6 +261,8 @@ func parseFlags() *config {
 		"The max duration each indexer will wait before forcing a flush")
 	flag.StringVar(&c.StatsDuration, "stats-duration", "10s",
 		"The max duration to wait before logging indexing stats")
+	flag.StringVar(&c.RetryDuration, "retry-duration", "5s",
+		"The max duration to wait before retrying network errors")
 	flag.IntVar(&c.Indexers, "indexers", 4,
 		"The number of go routines concurrently indexing documents")
 	flag.Var(&c.ChangeStreamNs, "change-stream-namespace", "MongoDB namespace to watch for changes")
@@ -318,11 +338,12 @@ func loadConfig() (*config, error) {
 }
 
 type indexStats struct {
-	Total      int64 `json:"total"`
 	Indexed    int64 `json:"indexed"`
 	Deleted    int64 `json:"deleted"`
 	Failed     int64 `json:"failed"`
 	Flushed    int64 `json:"flushed"`
+	Retried    int64 `json:"retried"`
+	Queued     int64 `json:"queued"`
 	sync.Mutex `json:"-"`
 }
 
@@ -346,25 +367,27 @@ type indexBuffer struct {
 	logs          *loggers
 	stats         *indexStats
 	curSize       int64
+	netErrors     int
 }
 
 type indexWorker struct {
-	client      *redisearch.Client
-	mongoClient *mongo.Client
-	config      *config
-	namespace   string
-	workQ       chan *gtm.Op
-	indexers    int
-	maxDuration time.Duration
-	maxItems    int
-	maxSize     int64
-	stopC       chan bool
-	allWg       *sync.WaitGroup
-	logs        *loggers
-	stats       *indexStats
-	createIndex bool
-	buffers     []*indexBuffer
-	schema      *redisearch.Schema
+	client        *redisearch.Client
+	mongoClient   *mongo.Client
+	config        *config
+	namespace     string
+	workQ         chan *gtm.Op
+	indexers      int
+	maxDuration   time.Duration
+	retryDuration time.Duration
+	maxItems      int
+	maxSize       int64
+	stopC         chan bool
+	allWg         *sync.WaitGroup
+	logs          *loggers
+	stats         *indexStats
+	createIndex   bool
+	buffers       []*indexBuffer
+	schema        *redisearch.Schema
 }
 
 type indexClient struct {
@@ -384,6 +407,7 @@ type indexClient struct {
 	stats         *indexStats
 	createIndex   bool
 	statsDuration time.Duration
+	retryDuration time.Duration
 	indexers      int
 }
 
@@ -424,42 +448,49 @@ func (is *indexStats) dup() *indexStats {
 	is.Lock()
 	defer is.Unlock()
 	return &indexStats{
-		Total:   is.Total,
 		Flushed: is.Flushed,
 		Indexed: is.Indexed,
 		Deleted: is.Deleted,
 		Failed:  is.Failed,
+		Retried: is.Retried,
+		Queued:  is.Queued,
 	}
 }
 
 func (is *indexStats) addFlushed() {
 	is.Lock()
-	defer is.Unlock()
 	is.Flushed++
-}
-
-func (is *indexStats) addTotal(count int) {
-	is.Lock()
-	defer is.Unlock()
-	is.Total += int64(count)
+	is.Unlock()
 }
 
 func (is *indexStats) addIndexed(count int) {
 	is.Lock()
-	defer is.Unlock()
 	is.Indexed += int64(count)
+	is.Unlock()
 }
 
 func (is *indexStats) addDeleted(count int) {
 	is.Lock()
-	defer is.Unlock()
 	is.Deleted += int64(count)
+	is.Unlock()
 }
 
 func (is *indexStats) addFailed(count int) {
 	is.Lock()
-	defer is.Unlock()
 	is.Failed += int64(count)
+	is.Unlock()
+}
+
+func (is *indexStats) addRetried(count int) {
+	is.Lock()
+	is.Retried += int64(count)
+	is.Unlock()
+}
+
+func (is *indexStats) addQueued(count int) {
+	is.Lock()
+	is.Queued += int64(count)
+	is.Unlock()
 }
 
 func flatmap(prefix string, e map[string]interface{}) map[string]interface{} {
@@ -533,41 +564,53 @@ func (ib *indexBuffer) toSchema() *redisearch.Schema {
 			for fk, fv := range flat {
 				switch fv.(type) {
 				case time.Time, int, int32, int64, float32, float64:
-					sc.AddField(redisearch.NewNumericField(fk))
+					sc.AddField(redisearch.NewSortableNumericField(fk))
 				default:
-					sc.AddField(redisearch.NewTextField(fk))
+					sc.AddField(redisearch.NewSortableTextField(fk, 1.0))
 				}
 			}
 		case time.Time, int, int32, int64, float32, float64:
-			sc.AddField(redisearch.NewNumericField(k))
+			sc.AddField(redisearch.NewSortableNumericField(k))
 		default:
-			sc.AddField(redisearch.NewTextField(k))
+			sc.AddField(redisearch.NewSortableTextField(k, 1.0))
 		}
 	}
 	return sc
 }
 
 func (ib *indexBuffer) afterFlush(err error) {
+	itemCount := len(ib.items)
 	ib.stats.addFlushed()
-	ib.stats.addTotal(len(ib.items))
 	if err == nil {
-		ib.stats.addIndexed(len(ib.items))
-		return
-	}
-	multiError, ok := err.(redisearch.MultiError)
-	if ok {
-		var failed, indexed int
-		for _, e := range multiError {
-			if e == nil {
-				indexed++
-			} else {
-				failed++
-			}
-		}
-		ib.stats.addFailed(failed)
-		ib.stats.addIndexed(indexed)
+		ib.stats.addIndexed(itemCount)
+		ib.stats.addQueued(-1 * itemCount)
+		ib.items = nil
 	} else {
-		ib.stats.addFailed(len(ib.items))
+		multiError, ok := err.(redisearch.MultiError)
+		if ok {
+			var failed, indexed int
+			var failedItems []redisearch.Document
+			for i, e := range multiError {
+				if e == nil {
+					indexed++
+				} else {
+					failed++
+					failedItems = append(failedItems, ib.items[i])
+				}
+			}
+			ib.items = failedItems
+			ib.stats.addFailed(failed)
+			ib.stats.addIndexed(indexed)
+			ib.stats.addQueued(-1 * indexed)
+		} else {
+			ib.stats.addFailed(itemCount)
+		}
+	}
+	ib.curSize = 0
+	if ib.maxSize != 0 {
+		for _, doc := range ib.items {
+			ib.curSize += int64(doc.EstimateSize())
+		}
 	}
 }
 
@@ -588,10 +631,42 @@ func (ib *indexBuffer) autoCreateIndex() (*redisearch.IndexInfo, error) {
 	return indexInfo, err
 }
 
+func isNetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	multiError, ok := err.(redisearch.MultiError)
+	if ok {
+		for _, e := range multiError {
+			if isNetError(e) {
+				return true
+			}
+		}
+	} else {
+		switch t := err.(type) {
+		case net.Error:
+			return true
+		case *net.OpError:
+			return true
+		case syscall.Errno:
+			if t == syscall.ECONNREFUSED {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (ib *indexBuffer) retryOk(err error) bool {
+	return isNetError(err) && ib.netErrors < ib.worker.config.MaxRetries
+}
+
+func (ib *indexBuffer) inRetry() bool {
+	return ib.netErrors > 0
+}
+
 func (ib *indexBuffer) flush() (err error) {
 	if len(ib.items) == 0 {
-		ib.items = nil
-		ib.curSize = 0
 		return
 	}
 	docs := ib.items
@@ -609,9 +684,29 @@ func (ib *indexBuffer) flush() (err error) {
 		}
 	}
 	ib.afterFlush(err)
+	ib.checkRetry(err)
+	return
+}
+
+func (ib *indexBuffer) checkRetry(err error) {
+	maxRetries := ib.worker.config.MaxRetries
+	if maxRetries > 0 {
+		if ib.retryOk(err) {
+			ib.netErrors += 1
+			ib.stats.addRetried(len(ib.items))
+		} else if ib.inRetry() {
+			errorLog.Println("Max retries reached. Dropping queued events to keep pipeline healthy")
+			ib.discard()
+		}
+	}
+}
+
+func (ib *indexBuffer) discard() {
+	itemCount := len(ib.items)
+	ib.netErrors = 0
+	ib.stats.addQueued(-1 * itemCount)
 	ib.items = nil
 	ib.curSize = 0
-	return
 }
 
 func (ib *indexBuffer) full() bool {
@@ -629,11 +724,21 @@ func (ib *indexBuffer) full() bool {
 }
 
 func (ib *indexBuffer) indexFailed(err error) {
-	ib.logs.errorLog.Printf("Indexing failed: %s", err)
+	logged := err
+	if multiError, ok := err.(redisearch.MultiError); ok {
+		for _, e := range multiError {
+			if e != nil && e.Error() == "Unknown index name" {
+				logged = e
+				break
+			}
+		}
+	}
+	ib.logs.errorLog.Printf("Indexing failed: %s", logged)
 }
 
 func (ib *indexBuffer) addItem(doc redisearch.Document) {
 	ib.items = append(ib.items, doc)
+	ib.worker.stats.addQueued(1)
 	if ib.maxSize != 0 {
 		ib.curSize += int64(doc.EstimateSize())
 	}
@@ -646,7 +751,6 @@ func (ib *indexBuffer) addItem(doc redisearch.Document) {
 
 func (ib *indexBuffer) handleInsert(op *gtm.Op) {
 	if op.Data == nil {
-		ib.stats.addTotal(1)
 		ib.stats.addFailed(1)
 		errorLog.Println("Insert event had no associated data")
 		return
@@ -670,7 +774,6 @@ func (ib *indexBuffer) handleInsert(op *gtm.Op) {
 		}
 		resp, err := plugin.OnInsert(req)
 		if err != nil {
-			ib.stats.addTotal(1)
 			ib.stats.addFailed(1)
 			errorLog.Printf("Insert handler for plugin %s[%s] returned error: %s", plugin.Name(), ref.path, err)
 			break
@@ -691,7 +794,6 @@ func (ib *indexBuffer) handleInsert(op *gtm.Op) {
 
 func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
 	if op.Data == nil {
-		ib.stats.addTotal(1)
 		ib.stats.addFailed(1)
 		errorLog.Println("Update event had no associated data")
 		return
@@ -715,7 +817,6 @@ func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
 		}
 		resp, err := plugin.OnUpdate(req)
 		if err != nil {
-			ib.stats.addTotal(1)
 			ib.stats.addFailed(1)
 			errorLog.Printf("Update handler for plugin %s[%s] returned error: %s", plugin.Name(), ref.path, err)
 			break
@@ -734,7 +835,8 @@ func (ib *indexBuffer) handleUpdate(op *gtm.Op) {
 	}
 }
 
-func (iw *indexWorker) handleDelete(op *gtm.Op) {
+func (iw *indexWorker) handleDelete(op *gtm.Op) redisearch.MultiError {
+	var errors redisearch.MultiError
 	config := iw.config
 	client := iw.client
 	for _, ref := range config.eventHandlers {
@@ -755,7 +857,7 @@ func (iw *indexWorker) handleDelete(op *gtm.Op) {
 		}
 		resp, err := plugin.OnDelete(req)
 		if err != nil {
-			iw.stats.addTotal(1)
+			errors = append(errors, err)
 			iw.stats.addFailed(1)
 			errorLog.Printf("Delete handler for plugin %s[%s] returned error: %s", plugin.Name(), ref.path, err)
 			break
@@ -763,14 +865,16 @@ func (iw *indexWorker) handleDelete(op *gtm.Op) {
 		if resp != nil {
 			docIds := resp.ToDelete
 			if docIds != nil {
+				iw.stats.addQueued(len(docIds))
 				for _, docId := range docIds {
-					iw.stats.addTotal(1)
 					if err := client.Delete(docId, true); err == nil {
 						iw.stats.addDeleted(1)
 					} else {
+						errors = append(errors, err)
 						iw.stats.addFailed(1)
 						iw.logs.errorLog.Printf("Delete of document ID %s failed: %s", docId, err)
 					}
+					iw.stats.addQueued(-1)
 				}
 			}
 			if resp.Finished {
@@ -778,6 +882,10 @@ func (iw *indexWorker) handleDelete(op *gtm.Op) {
 			}
 		}
 	}
+	if len(errors) > 0 {
+		return errors
+	}
+	return nil
 }
 
 func (ib *indexBuffer) handleEvent(op *gtm.Op) {
@@ -790,14 +898,26 @@ func (ib *indexBuffer) handleEvent(op *gtm.Op) {
 
 func (ib *indexBuffer) run() {
 	defer ib.worker.allWg.Done()
-	timer := time.NewTicker(ib.maxDuration)
-	defer timer.Stop()
+	autoFlush := time.NewTicker(ib.maxDuration)
+	retryFlush := time.NewTicker(ib.worker.retryDuration)
+	defer autoFlush.Stop()
+	defer retryFlush.Stop()
 	done := false
 	for !done {
 		select {
 		case op := <-ib.worker.workQ:
 			ib.handleEvent(op)
-		case <-timer.C:
+		case <-autoFlush.C:
+			if ib.netErrors > 0 {
+				break
+			}
+			if err := ib.flush(); err != nil {
+				ib.indexFailed(err)
+			}
+		case <-retryFlush.C:
+			if ib.netErrors == 0 {
+				break
+			}
 			if err := ib.flush(); err != nil {
 				ib.indexFailed(err)
 			}
@@ -835,12 +955,32 @@ func (iw *indexWorker) add(op *gtm.Op) *indexWorker {
 func (iw *indexWorker) remove(op *gtm.Op) *indexWorker {
 	// since there are no version numbers to maintain sequence do the best we can.
 	// flush all pending index requests and immediately do the delete
-	for _, ib := range iw.buffers {
-		if err := ib.flush(); err != nil {
-			ib.indexFailed(err)
+	buffersEmpty := 0
+	for {
+		for _, ib := range iw.buffers {
+			if err := ib.flush(); err != nil {
+				ib.indexFailed(err)
+			} else {
+				buffersEmpty += 1
+			}
+		}
+		if buffersEmpty == len(iw.buffers) {
+			break
+		}
+		buffersEmpty = 0
+	}
+	netErrors := 0
+	for {
+		if err := iw.handleDelete(op); err == nil || !isNetError(err) {
+			break
+		} else {
+			iw.stats.addRetried(len(err))
+			netErrors += 1
+			if netErrors >= iw.config.MaxRetries {
+				break
+			}
 		}
 	}
-	iw.handleDelete(op)
 	return iw
 }
 
@@ -857,6 +997,7 @@ func newLoggers() *loggers {
 func newIndexClient(client *mongo.Client, ctx *gtm.OpCtx, conf *config) *indexClient {
 	maxDuration, _ := time.ParseDuration(conf.MaxDuration)
 	statsDuration, _ := time.ParseDuration(conf.StatsDuration)
+	retryDuration, _ := time.ParseDuration(conf.RetryDuration)
 	createIndex := conf.DisableCreateIndex == false
 	return &indexClient{
 		mongoClient:   client,
@@ -876,6 +1017,7 @@ func newIndexClient(client *mongo.Client, ctx *gtm.OpCtx, conf *config) *indexCl
 		stats:         &indexStats{},
 		createIndex:   createIndex,
 		statsDuration: statsDuration,
+		retryDuration: retryDuration,
 	}
 }
 
@@ -1048,21 +1190,22 @@ func (ic *indexClient) queue(op *gtm.Op) *indexClient {
 	worker := ic.workers[ns]
 	if worker == nil {
 		worker = &indexWorker{
-			config:      ic.config,
-			client:      c,
-			mongoClient: ic.mongoClient,
-			indexers:    ic.indexers,
-			namespace:   ns,
-			maxDuration: ic.maxDuration,
-			maxItems:    ic.maxItems,
-			maxSize:     ic.maxSize,
-			workQ:       make(chan *gtm.Op),
-			stopC:       ic.stopC,
-			allWg:       ic.allWg,
-			logs:        ic.logs,
-			stats:       ic.stats,
-			createIndex: ic.createIndex,
-			schema:      schema,
+			config:        ic.config,
+			client:        c,
+			mongoClient:   ic.mongoClient,
+			indexers:      ic.indexers,
+			namespace:     ns,
+			maxDuration:   ic.maxDuration,
+			retryDuration: ic.retryDuration,
+			maxItems:      ic.maxItems,
+			maxSize:       ic.maxSize,
+			workQ:         make(chan *gtm.Op),
+			stopC:         ic.stopC,
+			allWg:         ic.allWg,
+			logs:          ic.logs,
+			stats:         ic.stats,
+			createIndex:   ic.createIndex,
+			schema:        schema,
 		}
 		ic.workers[ns] = worker
 		worker.start()

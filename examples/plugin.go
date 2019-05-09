@@ -34,7 +34,11 @@ func (s *pluginSchema) Handles(ev *module.SchemaEvent) bool {
 }
 
 func (s *pluginSchema) Schema(ev *module.SchemaEvent) (*module.SchemaResponse, error) {
+	// Set the name of the RediSearch namespace to be my-index
+	// instead of defaulting to the MongoDB namespace, which is in this case test.test
+	// Then you can search with the command ft.search my-index *
 	index := "my-index"
+	// Create a schema for the index with one text field named foo
 	schema := redisearch.NewSchema(redisearch.DefaultOptions)
 	schema.AddField(redisearch.NewTextField("foo"))
 	return &module.SchemaResponse{
@@ -56,12 +60,14 @@ func (h *pluginHandler) Handles(ev *module.Event) bool {
 }
 
 func (h *pluginHandler) handleUpsert(op *gtm.Op) (*module.IndexResponse, error) {
+	// maps the MongoDB document to 1 or more corresponding RediSearch documents
+	// in this case we map it 1 to 1 only projecting the foo field
 	id := op.Id
 	if docId, ok := id.(primitive.ObjectID); ok {
 		doc := redisearch.NewDocument(docId.Hex(), 1.0)
 		data := op.Data
 		if data["foo"] == nil {
-			return nil, fmt.Errorf("Expected doc to contain a foo property")
+			return nil, fmt.Errorf("Expected document to contain a foo property")
 		}
 		if val, ok := data["foo"].(string); ok {
 			doc.Set("foo", val)
@@ -73,23 +79,23 @@ func (h *pluginHandler) handleUpsert(op *gtm.Op) (*module.IndexResponse, error) 
 			return nil, fmt.Errorf("Document foo property was not a string")
 		}
 	} else {
-		return nil, fmt.Errorf("Expected ID to be an ObjectID")
+		return nil, fmt.Errorf("Expected document _id to be an ObjectID")
 	}
 }
 
 func (h *pluginHandler) OnInsert(ev *module.InsertEvent) (*module.IndexResponse, error) {
-    // the event has access to the MongoDB and RediSearch clients for complex processing
-    // in this case we only map the MongoDB document to a RediSearch document
-    // remember that to suppress the default index handler one must return Finished:true
-    // in the response
+	// the event has access to the MongoDB and RediSearch clients for complex processing
+	// in this case we only map the MongoDB document to a RediSearch document
+	// remember that to suppress the default index handler one must return Finished:true
+	// in the response
 	return h.handleUpsert(ev.Op)
 }
 
 func (h *pluginHandler) OnUpdate(ev *module.UpdateEvent) (*module.IndexResponse, error) {
-    // the event has access to the MongoDB and RediSearch clients for complex processing
-    // in this case we only map the MongoDB document to a RediSearch document
-    // remember that to suppress the default index handler one must return Finished:true
-    // in the response
+	// the event has access to the MongoDB and RediSearch clients for complex processing
+	// in this case we only map the MongoDB document to a RediSearch document
+	// remember that to suppress the default index handler one must return Finished:true
+	// in the response
 	return h.handleUpsert(ev.Op)
 }
 
@@ -101,6 +107,6 @@ func (h *pluginHandler) OnDelete(ev *module.DeleteEvent) (*module.DeleteResponse
 			Finished: true,
 		}, nil
 	} else {
-		return nil, fmt.Errorf("Expected ID to be an ObjectID")
+		return nil, fmt.Errorf("Expected document _id to be an ObjectID")
 	}
 }
