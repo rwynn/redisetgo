@@ -585,7 +585,7 @@ func (ib *indexBuffer) afterFlush(err error) {
 		ib.stats.addIndexed(itemCount)
 		ib.stats.addQueued(-1 * itemCount)
 		ib.items = nil
-	} else {
+	} else if !isNetError(err) {
 		multiError, ok := err.(redisearch.MultiError)
 		if ok {
 			var failed, indexed int
@@ -605,6 +605,8 @@ func (ib *indexBuffer) afterFlush(err error) {
 		} else {
 			ib.stats.addFailed(itemCount)
 		}
+	} else {
+		ib.stats.addFailed(itemCount)
 	}
 	ib.curSize = 0
 	if ib.maxSize != 0 {
