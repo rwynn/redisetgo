@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"plugin"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -69,7 +70,7 @@ func (df *defaultHandler) OnUpdate(ev *module.UpdateEvent) (*module.IndexRespons
 }
 
 func (df *defaultHandler) OnDelete(ev *module.DeleteEvent) (*module.DeleteResponse, error) {
-	docId := opIDToString(ev.Op)
+	docId := toDocID(ev.Op)
 	return &module.DeleteResponse{
 		ToDelete: []string{docId},
 		Finished: true,
@@ -501,28 +502,31 @@ func (args *stringargs) Set(value string) error {
 	return nil
 }
 
-func opIDToString(op *gtm.Op) (id string) {
+func toDocID(op *gtm.Op) string {
+	var id strings.Builder
+	id.WriteString(op.Namespace)
+	id.WriteString(".")
 	switch val := op.Id.(type) {
 	case primitive.ObjectID:
-		id = val.Hex()
+		id.WriteString(val.Hex())
 	case float64:
 		intID := int(val)
 		if op.Id.(float64) == float64(intID) {
-			id = fmt.Sprintf("%v", intID)
+			fmt.Fprintf(&id, "%v", intID)
 		} else {
-			id = fmt.Sprintf("%v", op.Id)
+			fmt.Fprintf(&id, "%v", op.Id)
 		}
 	case float32:
 		intID := int(val)
 		if op.Id.(float32) == float32(intID) {
-			id = fmt.Sprintf("%v", intID)
+			fmt.Fprintf(&id, "%v", intID)
 		} else {
-			id = fmt.Sprintf("%v", op.Id)
+			fmt.Fprintf(&id, "%v", op.Id)
 		}
 	default:
-		id = fmt.Sprintf("%v", op.Id)
+		fmt.Fprintf(&id, "%v", op.Id)
 	}
-	return
+	return id.String()
 }
 
 func (is *indexStats) dup() *indexStats {
@@ -595,7 +599,7 @@ func flatmap(prefix string, e map[string]interface{}) map[string]interface{} {
 }
 
 func createDoc(op *gtm.Op) redisearch.Document {
-	docId := opIDToString(op)
+	docId := toDocID(op)
 	doc := redisearch.NewDocument(docId, 1.0)
 	for k, v := range op.Data {
 		if k == "_id" {
