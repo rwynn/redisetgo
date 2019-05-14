@@ -106,32 +106,60 @@ type config struct {
 	PluginFiles          stringargs `toml:"plugins" json:"plugins"`
 	eventHandlers        []eventHandlerRef
 	schemaHandlers       []module.SchemaHandler
+	pipeBuilders         []module.PipeBuilder
+}
+
+func (c *config) buildPipe() gtm.PipelineBuilder {
+	if len(c.pipeBuilders) == 0 {
+		return nil
+	}
+	return func(namespace string, changeStream bool) ([]interface{}, error) {
+		pr := &module.PipeRequest{
+			Namespace:    namespace,
+			ChangeStream: changeStream,
+		}
+		for _, pb := range c.pipeBuilders {
+			resp, err := pb.BuildPipeline(pr)
+			if err != nil {
+				errorLog.Printf("Error in pipeline builder[%s]: %s", pb.Name(), err)
+				continue
+			}
+			if resp != nil && len(resp.Stages) > 0 {
+				var stages []interface{}
+				for _, stage := range resp.Stages {
+					stages = append(stages, stage)
+				}
+				return stages, nil
+			}
+		}
+		return nil, nil
+	}
 }
 
 func (c *config) resumeFunc() gtm.TimestampGenerator {
-	if c.Resume {
-		return func(client *mongo.Client, opts *gtm.Options) (primitive.Timestamp, error) {
-			var ts primitive.Timestamp
-			col := client.Database(c.MetadataDB).Collection("resume")
-			result := col.FindOne(context.Background(), bson.M{
-				"_id": c.ResumeName,
-			})
-			if err := result.Err(); err == nil {
-				doc := make(map[string]interface{})
-				if err = result.Decode(&doc); err == nil {
-					if doc["ts"] != nil {
-						ts = doc["ts"].(primitive.Timestamp)
-					}
+	if !c.Resume {
+		return nil
+	}
+	return func(client *mongo.Client, opts *gtm.Options) (primitive.Timestamp, error) {
+		var ts primitive.Timestamp
+		col := client.Database(c.MetadataDB).Collection("resume")
+		result := col.FindOne(context.Background(), bson.M{
+			"_id": c.ResumeName,
+		})
+		if err := result.Err(); err == nil {
+			doc := make(map[string]interface{})
+			if err = result.Decode(&doc); err == nil {
+				if doc["ts"] != nil {
+					ts = doc["ts"].(primitive.Timestamp)
 				}
 			}
-			if ts.T == 0 {
-				ts, _ = gtm.LastOpTimestamp(client, opts)
-			}
-			infoLog.Printf("Resuming from timestamp %+v", ts)
-			return ts, nil
 		}
+		if ts.T == 0 {
+			ts, _ = gtm.LastOpTimestamp(client, opts)
+		}
+		infoLog.Printf("Resuming from timestamp %+v", ts)
+		return ts, nil
 	}
-	return nil
 }
 
 func (c *config) hasFlag(name string) bool {
@@ -159,6 +187,9 @@ func (c *config) setDefaults() *config {
 	}
 	if len(c.schemaHandlers) == 0 {
 		c.schemaHandlers = []module.SchemaHandler{}
+	}
+	if len(c.pipeBuilders) == 0 {
+		c.pipeBuilders = []module.PipeBuilder{}
 	}
 	if len(c.PluginFiles) == 0 {
 		c.PluginFiles = []string{}
@@ -353,6 +384,10 @@ func (c *config) loadPluginFile(pf string) error {
 	sh := plug.Schemas
 	if sh != nil {
 		c.schemaHandlers = append(c.schemaHandlers, sh)
+	}
+	pb := plug.Pipeline
+	if pb != nil {
+		c.pipeBuilders = append(c.pipeBuilders, pb)
 	}
 	return nil
 }
@@ -1142,7 +1177,7 @@ func (client *indexClient) saveTimestamp(ts primitive.Timestamp) error {
 		return nil
 	}
 	col := mclient.Database(config.MetadataDB).Collection("resume")
-	doc := map[string]interface{}{
+	doc := bson.M{
 		"ts": ts,
 	}
 	opts := options.Update()
@@ -1382,6 +1417,7 @@ func mustConnect(conf *config) *mongo.Client {
 func startReads(client *mongo.Client, conf *config) *gtm.OpCtx {
 	ctx := gtm.Start(client, &gtm.Options{
 		After:              conf.resumeFunc(),
+		Pipe:               conf.buildPipe(),
 		ChangeStreamNs:     conf.ChangeStreamNs,
 		DirectReadNs:       conf.DirectReadNs,
 		DirectReadConcur:   conf.DirectReadConcur,

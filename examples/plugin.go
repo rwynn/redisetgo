@@ -5,6 +5,7 @@ import (
 	"github.com/RediSearch/redisearch-go/redisearch"
 	"github.com/rwynn/gtm"
 	"github.com/rwynn/redisetgo/module"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -16,9 +17,43 @@ type myPlugin struct{}
 
 func (p *myPlugin) Get() module.Plugin {
 	plugin := module.Plugin{}
+	// you can opt in to setting Events, Schemas, and Pipelines
+	// you don't need to set all in each plugin
 	plugin.Events = []module.EventHandler{&pluginHandler{name: "examplePluginHandler"}}
 	plugin.Schemas = &pluginSchema{name: "examplePluginSchema"}
+	plugin.Pipeline = &pluginPipeline{name: "examplePluginPipeline"}
 	return plugin
+}
+
+type pluginPipeline struct {
+	name string
+}
+
+func (pipe *pluginPipeline) Name() string {
+	return pipe.name
+}
+
+func (pipe *pluginPipeline) BuildPipeline(r *module.PipeRequest) (*module.PipeResponse, error) {
+	// This pipeline puts a filter on direct reads and change events
+	// such that only those documents with the foo property are processed
+	var stages []bson.M
+	if r.ChangeStream {
+		// for a change stream the document is nested instead a fullDocument field
+		stage := bson.M{
+			"$match": bson.M{
+				"fullDocument.foo": bson.M{"$exists": true},
+			},
+		}
+		stages = append(stages, stage)
+	} else {
+		stage := bson.M{
+			"$match": bson.M{
+				"foo": bson.M{"$exists": true},
+			},
+		}
+		stages = append(stages, stage)
+	}
+	return &module.PipeResponse{Stages: stages}, nil
 }
 
 type pluginSchema struct {
