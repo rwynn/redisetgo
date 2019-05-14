@@ -100,9 +100,38 @@ type config struct {
 	FailFast             bool       `toml:"fail-fast" json:"fail-fast"`
 	ExitAfterDirectReads bool       `toml:"exit-after-direct-reads" json:"exit-after-direct-reads"`
 	DisableStats         bool       `toml:"disable-stats" json:"disable-stats"`
+	Resume               bool       `toml:"resume" json:"resume"`
+	ResumeName           string     `toml:"resume-name" json:"resume-name"`
+	MetadataDB           string     `toml:"metadata-db" json:"metadata-db"`
 	PluginFiles          stringargs `toml:"plugins" json:"plugins"`
 	eventHandlers        []eventHandlerRef
 	schemaHandlers       []module.SchemaHandler
+}
+
+func (c *config) resumeFunc() gtm.TimestampGenerator {
+	if c.Resume {
+		return func(client *mongo.Client, opts *gtm.Options) (primitive.Timestamp, error) {
+			var ts primitive.Timestamp
+			col := client.Database(c.MetadataDB).Collection("resume")
+			result := col.FindOne(context.Background(), bson.M{
+				"_id": c.ResumeName,
+			})
+			if err := result.Err(); err == nil {
+				doc := make(map[string]interface{})
+				if err = result.Decode(&doc); err == nil {
+					if doc["ts"] != nil {
+						ts = doc["ts"].(primitive.Timestamp)
+					}
+				}
+			}
+			if ts.T == 0 {
+				ts, _ = gtm.LastOpTimestamp(client, opts)
+			}
+			infoLog.Printf("Resuming from timestamp %+v", ts)
+			return ts, nil
+		}
+	}
+	return nil
 }
 
 func (c *config) hasFlag(name string) bool {
@@ -186,6 +215,15 @@ func (c *config) override(fc *config) {
 	if fc.DisableStats {
 		c.DisableStats = true
 	}
+	if fc.Resume {
+		c.Resume = true
+	}
+	if !c.hasFlag("metadata-db") && fc.MetadataDB != "" {
+		c.MetadataDB = fc.MetadataDB
+	}
+	if !c.hasFlag("resume-name") && fc.ResumeName != "" {
+		c.ResumeName = fc.ResumeName
+	}
 	if !c.hasFlag("max-items") && fc.MaxItems != 0 {
 		c.MaxItems = fc.MaxItems
 	}
@@ -251,6 +289,12 @@ func parseFlags() *config {
 		"True to exit the process after direct reads have completed")
 	flag.BoolVar(&c.DisableStats, "disable-stats", false,
 		"True to disable periodic logging of indexing stats")
+	flag.BoolVar(&c.Resume, "resume", false,
+		"True to resume indexing from last saved timestamp")
+	flag.StringVar(&c.ResumeName, "resume-name", "default",
+		"Key to store and load saved timestamps from")
+	flag.StringVar(&c.MetadataDB, "metadata-db", "redisetgo",
+		"Name of the MongoDB database to store redisetgo metadata")
 	flag.IntVar(&c.MaxRetries, "max-retries", 10,
 		"The max number of times an indexing request will be retried on a network failure")
 	flag.IntVar(&c.MaxItems, "max-items", 1000,
@@ -409,6 +453,8 @@ type indexClient struct {
 	statsDuration time.Duration
 	retryDuration time.Duration
 	indexers      int
+	timestamp     primitive.Timestamp
+	sync.Mutex
 }
 
 func (args *stringargs) String() string {
@@ -1077,10 +1123,73 @@ func (ic *indexClient) readListen() {
 	}
 }
 
+func (client *indexClient) getTimestamp() primitive.Timestamp {
+	client.Lock()
+	defer client.Unlock()
+	return client.timestamp
+}
+
+func (client *indexClient) setTimestamp(ts primitive.Timestamp) {
+	client.Lock()
+	client.timestamp = ts
+	client.Unlock()
+}
+
+func (client *indexClient) saveTimestamp(ts primitive.Timestamp) error {
+	config := client.config
+	mclient := client.mongoClient
+	if ts.T == 0 {
+		return nil
+	}
+	col := mclient.Database(config.MetadataDB).Collection("resume")
+	doc := map[string]interface{}{
+		"ts": ts,
+	}
+	opts := options.Update()
+	opts.SetUpsert(true)
+	_, err := col.UpdateOne(context.Background(), bson.M{
+		"_id": config.ResumeName,
+	}, bson.M{
+		"$set": doc,
+	}, opts)
+	return err
+}
+
+func (client *indexClient) timestampLoop() {
+	ticker := time.NewTicker(time.Duration(10) * time.Second)
+	defer ticker.Stop()
+	running := true
+	lastTime := primitive.Timestamp{}
+	for running {
+		select {
+		case <-ticker.C:
+			ts := client.getTimestamp()
+			if ts.T > lastTime.T || (ts.T == lastTime.T && ts.I > lastTime.I) {
+				lastTime = ts
+				if err := client.saveTimestamp(lastTime); err != nil {
+					errorLog.Printf("Error saving timestamp: %s", err)
+				}
+			}
+			break
+		case <-client.stopC:
+			running = false
+			break
+		}
+	}
+}
+
+func (client *indexClient) metaLoop() {
+	config := client.config
+	if config.Resume {
+		go client.timestampLoop()
+	}
+}
+
 func (client *indexClient) eventLoop() {
 	go client.sigListen()
 	go client.readListen()
 	go client.statsLoop()
+	client.metaLoop()
 	ctx := client.readContext
 	drained := false
 	for {
@@ -1217,6 +1326,7 @@ func (ic *indexClient) queue(op *gtm.Op) *indexClient {
 	} else if op.IsDelete() {
 		worker.remove(op)
 	}
+	ic.setTimestamp(op.Timestamp)
 	return ic
 }
 
@@ -1269,6 +1379,18 @@ func mustConnect(conf *config) *mongo.Client {
 	return client
 }
 
+func startReads(client *mongo.Client, conf *config) *gtm.OpCtx {
+	ctx := gtm.Start(client, &gtm.Options{
+		After:              conf.resumeFunc(),
+		ChangeStreamNs:     conf.ChangeStreamNs,
+		DirectReadNs:       conf.DirectReadNs,
+		DirectReadConcur:   conf.DirectReadConcur,
+		DirectReadSplitMax: int32(conf.DirectReadSplitMax),
+		OpLogDisabled:      true,
+	})
+	return ctx
+}
+
 func main() {
 	var (
 		client *mongo.Client
@@ -1280,13 +1402,7 @@ func main() {
 	client = mustConnect(conf)
 	infoLog.Println("Connected to MongoDB")
 	defer client.Disconnect(context.Background())
-	ctx := gtm.Start(client, &gtm.Options{
-		ChangeStreamNs:     conf.ChangeStreamNs,
-		DirectReadNs:       conf.DirectReadNs,
-		DirectReadConcur:   conf.DirectReadConcur,
-		DirectReadSplitMax: int32(conf.DirectReadSplitMax),
-		OpLogDisabled:      true,
-	})
+	ctx := startReads(client, conf)
 	indexClient := newIndexClient(client, ctx, conf)
 	indexClient.eventLoop()
 }
