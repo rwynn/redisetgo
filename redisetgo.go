@@ -137,6 +137,13 @@ func (c *config) buildPipe() gtm.PipelineBuilder {
 	}
 }
 
+func (c *config) nsFilter() gtm.OpFilter {
+	db := c.MetadataDB
+	return func(op *gtm.Op) bool {
+		return op.GetDatabase() != db
+	}
+}
+
 func (c *config) resumeFunc() gtm.TimestampGenerator {
 	if !c.Resume {
 		return nil
@@ -1420,6 +1427,7 @@ func mustConnect(conf *config) *mongo.Client {
 
 func startReads(client *mongo.Client, conf *config) *gtm.OpCtx {
 	ctx := gtm.Start(client, &gtm.Options{
+		NamespaceFilter:    conf.nsFilter(),
 		After:              conf.resumeFunc(),
 		Pipe:               conf.buildPipe(),
 		ChangeStreamNs:     conf.ChangeStreamNs,
