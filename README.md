@@ -41,6 +41,22 @@ Run a query via redis-cli to ensure the indexing was successful
    2) "1"
 ```
 
+### configure redisetgo
+
+You can configure redisetgo via flags and/or a TOML config file.  The most important options are the 
+connection settings.  By default redisetgo will look to connect to MongoDB and RedisSearch on localhost
+at the default ports.  You can change this via
+
+```
+redisetgo -mongo mongodb://user:pass@hostname:port -redis hostname:6379
+```
+
+The MongoDB URL can be customized with
+[advanced settings](https://github.com/mongodb/mongo-go-driver/blob/v1.0.2/x/network/connstring/connstring.go)
+for security, etc.
+
+For Redisearch you can provide a comma separated list of host:port,host:port...
+
 ### customize the behavior with modules
 
 You can write you own modules to change the behavior.  See examples/plugin.go for an example.
