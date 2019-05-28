@@ -15,8 +15,11 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"plugin"
@@ -28,7 +31,7 @@ import (
 )
 
 const (
-	version = "0.0.1"
+	version = "1.0.0"
 )
 
 var (
@@ -105,9 +108,13 @@ type config struct {
 	ResumeName           string     `toml:"resume-name" json:"resume-name"`
 	MetadataDB           string     `toml:"metadata-db" json:"metadata-db"`
 	PluginFiles          stringargs `toml:"plugins" json:"plugins"`
+	EnableHTTPServer     bool       `toml:"http-server" json:"http-server"`
+	HTTPServerAddr       string     `toml:"http-server-addr" json:"http-server-addr"`
+	Pprof                bool       `toml:"pprof" json:"pprof"`
 	eventHandlers        []eventHandlerRef
 	schemaHandlers       []module.SchemaHandler
 	pipeBuilders         []module.PipeBuilder
+	viewConfig           bool
 }
 
 func (c *config) buildPipe() gtm.PipelineBuilder {
@@ -181,9 +188,10 @@ func (c *config) hasFlag(name string) bool {
 	return passed
 }
 
-func (c *config) log(out *log.Logger) {
+func (c *config) log(out io.Writer) {
 	if b, err := json.MarshalIndent(c, "", "  "); err == nil {
-		out.Println(string(b))
+		out.Write(b)
+		out.Write([]byte("\n"))
 	}
 }
 
@@ -242,6 +250,15 @@ func (c *config) override(fc *config) {
 	}
 	if !c.hasFlag("redisearch") && fc.RedisearchAddrs != "" {
 		c.RedisearchAddrs = fc.RedisearchAddrs
+	}
+	if fc.Pprof {
+		c.Pprof = true
+	}
+	if fc.EnableHTTPServer {
+		c.EnableHTTPServer = true
+	}
+	if !c.hasFlag("http-server-addr") && fc.HTTPServerAddr != "" {
+		c.HTTPServerAddr = fc.HTTPServerAddr
 	}
 	if fc.DisableCreateIndex {
 		c.DisableCreateIndex = true
@@ -316,6 +333,7 @@ func parseFlags() *config {
 	var v bool
 	flag.BoolVar(&v, "version", false, "Print the version number and exit")
 	flag.BoolVar(&v, "v", false, "Print the version number and exit")
+	flag.BoolVar(&c.viewConfig, "view-config", false, "Print the configuration and exit")
 	flag.StringVar(&c.ConfigFile, "f", "", "Path to a TOML formatted config file")
 	flag.StringVar(&c.MongoURI, "mongo", "mongodb://localhost:27017",
 		"MongoDB connection string URI")
@@ -356,6 +374,12 @@ func parseFlags() *config {
 		"The max number of times to split each collection for concurrent reads")
 	flag.IntVar(&c.DirectReadConcur, "direct-read-concur", 4,
 		"The max number collections to read concurrently")
+	flag.BoolVar(&c.EnableHTTPServer, "http-server", false,
+		"True to enable a HTTP server")
+	flag.StringVar(&c.HTTPServerAddr, "http-server-addr", ":8080",
+		"The address the HTTP server will bind to")
+	flag.BoolVar(&c.Pprof, "pprof", false,
+		"True to enable profiling support")
 	flag.Parse()
 	if v {
 		fmt.Println(version)
@@ -498,6 +522,8 @@ type indexClient struct {
 	retryDuration time.Duration
 	indexers      int
 	timestamp     primitive.Timestamp
+	started       time.Time
+	httpServer    *http.Server
 	sync.Mutex
 }
 
@@ -1233,6 +1259,7 @@ func (client *indexClient) metaLoop() {
 }
 
 func (client *indexClient) eventLoop() {
+	go client.serveHttp()
 	go client.sigListen()
 	go client.readListen()
 	go client.statsLoop()
@@ -1299,6 +1326,63 @@ func (ic *indexClient) stop() {
 	<-ic.readC
 	close(ic.stopC)
 	ic.allWg.Wait()
+}
+
+func (ic *indexClient) serveHttp() {
+	config := ic.config
+	if !config.EnableHTTPServer {
+		return
+	}
+	ic.buildServer()
+	s := ic.httpServer
+	infoLog.Printf("Starting http server at %s", s.Addr)
+	ic.started = time.Now()
+	err := s.ListenAndServe()
+	select {
+	case <-ic.stopC:
+		return
+	default:
+		errorLog.Fatalf("Unable to serve http at address %s: %s", s.Addr, err)
+	}
+}
+
+func (ic *indexClient) buildServer() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/started", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		data := (time.Now().Sub(ic.started)).String()
+		w.Write([]byte(data))
+	})
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+	})
+	if !ic.config.DisableStats {
+		mux.HandleFunc("/stats", func(w http.ResponseWriter, req *http.Request) {
+			stats, err := json.MarshalIndent(ic.stats.dup(), "", "    ")
+			if err == nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(200)
+				w.Write(stats)
+			} else {
+				w.WriteHeader(500)
+				fmt.Fprintf(w, "Unable to print statistics: %s", err)
+			}
+		})
+	}
+	if ic.config.Pprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+	s := &http.Server{
+		Addr:     ic.config.HTTPServerAddr,
+		Handler:  mux,
+		ErrorLog: errorLog,
+	}
+	ic.httpServer = s
 }
 
 func (ic *indexClient) queue(op *gtm.Op) *indexClient {
@@ -1446,7 +1530,10 @@ func main() {
 		conf   *config
 	)
 	conf = mustConfig()
-	conf.log(infoLog)
+	if conf.viewConfig {
+		conf.log(os.Stdout)
+		return
+	}
 	infoLog.Println("Establishing connection to MongoDB")
 	client = mustConnect(conf)
 	infoLog.Println("Connected to MongoDB")
