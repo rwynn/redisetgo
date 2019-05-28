@@ -10,7 +10,7 @@ require (
 	github.com/golang/snappy v0.0.1 // indirect
 	github.com/google/go-cmp v0.2.0 // indirect
 	github.com/pkg/errors v0.8.1 // indirect
-	github.com/rwynn/gtm v0.0.0-20190525195920-6fac56b3af7b
+	github.com/rwynn/gtm v0.0.0-20190528020459-26a133b33a61
 	github.com/serialx/hashring v0.0.0-20190422032157-8b2912629002 // indirect
 	github.com/stretchr/testify v1.3.0 // indirect
 	github.com/tidwall/pretty v0.0.0-20190325153808-1166b9ac2b65 // indirect
