@@ -1,1 +1,1 @@
-rwynn/redisetgo:1.0.0
+rwynn/redisetgo:1.0.1
