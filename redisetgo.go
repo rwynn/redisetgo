@@ -287,7 +287,7 @@ func (c *config) override(fc *config) {
 	if !c.hasFlag("max-size") && fc.MaxSize != 0 {
 		c.MaxSize = fc.MaxSize
 	}
-	if !c.hasFlag("max-retries") && fc.MaxRetries != 0 {
+	if !c.hasFlag("max-retries") && fc.MaxRetries != -1 {
 		c.MaxRetries = fc.MaxRetries
 	}
 	if !c.hasFlag("max-duration") && fc.MaxDuration != "" {
@@ -428,7 +428,7 @@ func (c *config) loadPluginFile(pf string) error {
 func loadConfig() (*config, error) {
 	c := parseFlags()
 	if c.ConfigFile != "" {
-		var fc config
+		fc := config{MaxRetries: -1}
 		if md, err := toml.DecodeFile(c.ConfigFile, &fc); err != nil {
 			return nil, err
 		} else if ud := md.Undecoded(); len(ud) != 0 {
@@ -480,6 +480,7 @@ type indexBuffer struct {
 	stats         *indexStats
 	curSize       int64
 	netErrors     int
+	retryWg       *sync.WaitGroup
 }
 
 type indexWorker struct {
@@ -815,10 +816,14 @@ func (ib *indexBuffer) checkRetry(err error) {
 		if ib.retryOk(err) {
 			ib.netErrors += 1
 			ib.stats.addRetried(len(ib.items))
-		} else if ib.inRetry() {
-			errorLog.Println("Max retries reached. Dropping queued events to keep pipeline healthy")
+		} else {
+			if ib.inRetry() {
+				errorLog.Println("Max retries reached. Dropping queued events to keep pipeline healthy")
+			}
 			ib.discard()
 		}
+	} else {
+		ib.discard()
 	}
 }
 
@@ -1017,31 +1022,48 @@ func (ib *indexBuffer) handleEvent(op *gtm.Op) {
 	}
 }
 
+func (ib *indexBuffer) retryLoop() {
+	defer ib.retryWg.Done()
+	retryFlush := time.NewTicker(ib.worker.retryDuration)
+	defer retryFlush.Stop()
+	done := false
+	for !done {
+		select {
+		case <-retryFlush.C:
+			if err := ib.flush(); err != nil {
+				ib.indexFailed(err)
+			}
+			done = ib.netErrors == 0
+		case <-ib.stopC:
+			done = true
+		}
+	}
+}
+
+func (ib *indexBuffer) retryWait() {
+	retry := ib.worker.config.MaxRetries > 0
+	if retry && ib.netErrors > 0 {
+		ib.retryWg.Add(1)
+		go ib.retryLoop()
+		ib.retryWg.Wait()
+	}
+}
+
 func (ib *indexBuffer) run() {
 	defer ib.worker.allWg.Done()
 	autoFlush := time.NewTicker(ib.maxDuration)
-	retryFlush := time.NewTicker(ib.worker.retryDuration)
 	defer autoFlush.Stop()
-	defer retryFlush.Stop()
 	done := false
 	for !done {
 		select {
 		case op := <-ib.worker.workQ:
 			ib.handleEvent(op)
+			ib.retryWait()
 		case <-autoFlush.C:
-			if ib.netErrors > 0 {
-				break
-			}
 			if err := ib.flush(); err != nil {
 				ib.indexFailed(err)
 			}
-		case <-retryFlush.C:
-			if ib.netErrors == 0 {
-				break
-			}
-			if err := ib.flush(); err != nil {
-				ib.indexFailed(err)
-			}
+			ib.retryWait()
 		case <-ib.stopC:
 			done = true
 		}
@@ -1062,6 +1084,7 @@ func (iw *indexWorker) start() {
 			stopC:       iw.stopC,
 			logs:        iw.logs,
 			stats:       iw.stats,
+			retryWg:     &sync.WaitGroup{},
 		}
 		iw.buffers = append(iw.buffers, buf)
 		go buf.run()
