@@ -708,34 +708,28 @@ func (ib *indexBuffer) afterFlush(err error) {
 	itemCount := len(ib.items)
 	ib.stats.addFlushed()
 	if err == nil {
+		ib.items = nil
 		ib.stats.addIndexed(itemCount)
 		ib.stats.addQueued(-1 * itemCount)
-		ib.items = nil
 	} else if !isNetError(err) {
 		multiError, ok := err.(redisearch.MultiError)
 		if ok {
-			var failed, indexed int
+			var indexed int
 			var failedItems []redisearch.Document
 			for i, e := range multiError {
 				if e == nil {
 					indexed++
 				} else {
-					failed++
 					failedItems = append(failedItems, ib.items[i])
 				}
 			}
 			ib.items = failedItems
-			ib.stats.addFailed(failed)
 			ib.stats.addIndexed(indexed)
 			ib.stats.addQueued(-1 * indexed)
-		} else {
-			ib.stats.addFailed(itemCount)
 		}
-	} else {
-		ib.stats.addFailed(itemCount)
 	}
 	ib.curSize = 0
-	if ib.maxSize != 0 {
+	if ib.items != nil && ib.maxSize != 0 {
 		for _, doc := range ib.items {
 			ib.curSize += int64(doc.EstimateSize())
 		}
@@ -837,6 +831,7 @@ func (ib *indexBuffer) checkRetry(err error) {
 func (ib *indexBuffer) discard() {
 	itemCount := len(ib.items)
 	ib.netErrors = 0
+	ib.stats.addFailed(itemCount)
 	ib.stats.addQueued(-1 * itemCount)
 	ib.items = nil
 	ib.curSize = 0
