@@ -110,6 +110,7 @@ type config struct {
 	PluginFiles          stringargs `toml:"plugins" json:"plugins"`
 	EnableHTTPServer     bool       `toml:"http-server" json:"http-server"`
 	HTTPServerAddr       string     `toml:"http-server-addr" json:"http-server-addr"`
+	Language             string     `toml:"language" json:"language"`
 	Pprof                bool       `toml:"pprof" json:"pprof"`
 	eventHandlers        []eventHandlerRef
 	schemaHandlers       []module.SchemaHandler
@@ -257,6 +258,9 @@ func (c *config) override(fc *config) {
 	if fc.EnableHTTPServer {
 		c.EnableHTTPServer = true
 	}
+	if !c.hasFlag("language") && fc.Language != "" {
+		c.Language = fc.Language
+	}
 	if !c.hasFlag("http-server-addr") && fc.HTTPServerAddr != "" {
 		c.HTTPServerAddr = fc.HTTPServerAddr
 	}
@@ -378,6 +382,8 @@ func parseFlags() *config {
 		"True to enable a HTTP server")
 	flag.StringVar(&c.HTTPServerAddr, "http-server-addr", ":8080",
 		"The address the HTTP server will bind to")
+	flag.StringVar(&c.Language, "language", "",
+		"The language to index for.  Defaults to english. See RediSearch docs for available values")
 	flag.BoolVar(&c.Pprof, "pprof", false,
 		"True to enable profiling support")
 	flag.Parse()
@@ -793,7 +799,8 @@ func (ib *indexBuffer) flush() (err error) {
 	}
 	docs := ib.items
 	client := ib.worker.client
-	indexOptions := redisearch.IndexingOptions{Replace: true}
+	config := ib.worker.config
+	indexOptions := redisearch.IndexingOptions{Replace: true, Language: config.Language}
 	err = client.IndexOptions(indexOptions, docs...)
 	if err != nil && ib.worker.createIndex {
 		// attempt to create schema and index on the fly
