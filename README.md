@@ -2,7 +2,7 @@
 
 Continuously index your MongoDB data stream in [RediSearch](https://redislabs.com/redis-enterprise/technology/redis-search/).
 
-#### setup MongoDB
+### setup MongoDB
 
 Before running redisetgo you will need to ensure that MongoDB is setup as a replica set.
 
