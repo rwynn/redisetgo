@@ -2,6 +2,19 @@
 
 Continuously index your MongoDB data stream in [RediSearch](https://redislabs.com/redis-enterprise/technology/redis-search/).
 
+#### setup MongoDB
+
+Before running redisetgo you will need to ensure that MongoDB is setup as a replica set.
+
+Following the instructions for [deploying a replica set](http://docs.mongodb.org/manual/tutorial/deploy-replica-set/).
+
+If you haven't already done so,
+follow the 5 step [procedure](https://docs.mongodb.com/manual/tutorial/deploy-replica-set/#procedure)
+to initiate and validate your replica set.
+
+For local testing your replica set may contain a
+[single member](https://docs.mongodb.com/manual/tutorial/convert-standalone-to-replica-set/).
+
 ### testing with docker
 
 Start up a redisearch server
