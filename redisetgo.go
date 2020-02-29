@@ -5,16 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/toml"
-	"github.com/RediSearch/redisearch-go/redisearch"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/redisetgo/module"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsoncodec"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"io"
 	"log"
 	"net"
@@ -28,10 +18,21 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/RediSearch/redisearch-go/redisearch"
+	"github.com/rwynn/gtm"
+	"github.com/rwynn/redisetgo/module"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsoncodec"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
-	version = "1.1.0"
+	version = "1.1.1"
 )
 
 var (
