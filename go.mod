@@ -9,5 +9,5 @@ require (
 	github.com/rwynn/gtm v0.0.0-20190819153110-515be98d5e90
 	github.com/serialx/hashring v0.0.0-20190422032157-8b2912629002 // indirect
 	github.com/xdg/stringprep v1.0.0 // indirect
-	go.mongodb.org/mongo-driver v1.3.0
+	go.mongodb.org/mongo-driver v1.3.1
 )
