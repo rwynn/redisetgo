@@ -49,7 +49,7 @@ Run a query via redis-cli to ensure the indexing was successful
 ```
 127.0.0.1:6379> FT.SEARCH test.test *
 1) (integer) 1
-2) "5cc9ae490862227ef20c3116"
+2) "test.test.5cc9ae490862227ef20c3116"
 3) 1) "foo"
    2) "1"
 ```
