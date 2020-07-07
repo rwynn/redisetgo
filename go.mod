@@ -9,7 +9,7 @@ require (
 	github.com/klauspost/compress v1.10.10 // indirect
 	github.com/minio/highwayhash v1.0.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/rwynn/gtm v0.0.0-20190819153110-515be98d5e90
+	github.com/rwynn/gtm v1.0.1-0.20200508024042-5e8f85c19860
 	github.com/serialx/hashring v0.0.0-20190515033939-7706f26af194 // indirect
 	github.com/xdg/stringprep v1.0.0 // indirect
 	go.mongodb.org/mongo-driver v1.3.4
