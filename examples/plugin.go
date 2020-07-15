@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"github.com/RediSearch/redisearch-go/redisearch"
-	"github.com/rwynn/gtm"
+	"github.com/rwynn/gtm/v2"
 	"github.com/rwynn/redisetgo/module"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
